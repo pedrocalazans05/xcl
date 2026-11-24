@@ -2148,6 +2148,90 @@ mod tests {
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
     }
 
+    /// Real GPU: render targets at two addresses of one physical page (mapped at the second after
+    /// the first, as a retail game aliases its targets) share one page of video memory, as on the
+    /// console; a target on another physical page gets its own.
+    #[test]
+    fn render_targets_on_one_physical_page_share_its_video_memory() {
+        // (a test that panicked holding these locks does not fail this one too)
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::hle::kernelx;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const NAME: &str = "render_targets_on_one_physical_page_share_its_video_memory";
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return println!("SKIPPED {NAME}: software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return println!("SKIPPED {NAME}: no D3D12 device") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return println!("SKIPPED {NAME}: tiled tier < 2");
+            }
+            // (`vram::place` keeps no render target on pages below resource heap tier 2)
+            if opts.ResourceHeapTier.0 < 2 {
+                return println!("SKIPPED {NAME}: resource heap tier < 2");
+            }
+            if crate::gpu::uma::get().is_none() {
+                return println!("SKIPPED {NAME}: no UMA");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // a 128x128 R8G8B8A8 render target: one 64 KiB page on the console and on the PC
+            let mut rt = console_desc(3, 128, 128, 1, 1, 28, 0x109);
+            rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+            let place = |va: usize| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, rt.as_ptr(), D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX at {va:#x}: {hr:#x}");
+                assert!(super::super::vram::is_placed_texture(p as usize), "expected a vram::Pages target at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let dev_pages = || super::super::vram::page_bytes_for(dev.as_raw() as usize).0;
+            let lost = || super::super::vram::tiles_unaccounted_for(dev.as_raw() as usize);
+            let space = VirtualAlloc(std::ptr::null(), 4 << 20, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(space, 0);
+            let (a, b, c, d) = (space, space + (1 << 20), space + (2 << 20), space + (3 << 20));
+            let (mut n, mut pages) = (3usize, [0usize; 3]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let (before, lost_before) = (dev_pages(), lost());
+            assert_eq!(kernelx::MapTitlePhysicalPages(a as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, a);
+            let first = place(a);
+            // the same page at a second address: the console's alias of `a`
+            assert_eq!(kernelx::MapTitlePhysicalPages(b as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, b);
+            let second = place(b);
+            let shared = dev_pages() - before;
+            // another physical page: video memory of its own
+            assert_eq!(kernelx::MapTitlePhysicalPages(c as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(1)) as usize, c);
+            let third = place(c);
+            let all = dev_pages() - before;
+            // a target at `d` with no page mapped (keyed by its address), then a page mapped there
+            // and a second target: its page is keyed by the physical page, which has none yet
+            let fourth = place(d);
+            assert_eq!(kernelx::MapTitlePhysicalPages(d as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(2)) as usize, d);
+            let fifth = place(d);
+            let lost_after = lost();
+            drop((first, second, third, fourth, fifth));
+            let mut none = [0usize; 1];
+            kernelx::MapTitlePhysicalPages(b as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::MapTitlePhysicalPages(c as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::MapTitlePhysicalPages(d as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr());
+            VirtualFree(space as *mut c_void, 0, MEM_RELEASE);
+            assert_eq!(shared, 0x1_0000, "two targets on one physical page: one page of video memory");
+            assert_eq!(all, 0x2_0000, "a target on another physical page: a page of its own");
+            assert_eq!(lost_after, lost_before, "every pool tile taken is a page's");
+        }
+    }
+
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased
     /// overlapping placements stays bounded in video memory, superseded textures never corrupt
     /// newer placements on shared tiles, 4 KiB-aligned neighbours never false-alias, and mip

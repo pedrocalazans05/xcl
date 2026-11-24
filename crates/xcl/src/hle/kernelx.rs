@@ -923,6 +923,16 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
+/// The physical page mapped away from home at each of the `n` 64 KiB pages from `va` (None: none
+/// there, or a page at its home). The console maps one page at several addresses at once; here it
+/// is at one (`map_pages` moves it), so `d3d12x::vram` asks which page an address had to let
+/// textures at two addresses of one page share its video memory.
+pub fn physical_pages(va: usize, n: usize) -> Vec<Option<usize>> {
+    let g = AWAY.lock().unwrap();
+    let Some(a) = g.as_ref() else { return vec![None; n] };
+    (0..n).map(|i| va.checked_add(i * PHYS_PAGE).and_then(|at| a.at.get(&at).copied())).collect()
+}
+
 /// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
 /// `physical_page_at` says there may have changed.
 static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
