@@ -934,6 +934,19 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// Thread-group dimensions `[x, y, z]` of a console compute shader (FSPX or FSSM).
+pub fn compute_threads(blob: &[u8]) -> Option<[u32; 3]> {
+    if let Some(f) = fspx(blob) {
+        return Some(f.threads);
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(cs.threads),
+        _ => None,
+    }
+}
+
 /// The HLSL and profile a console program compiles from at pipeline creation (for
 /// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
 pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {

@@ -452,6 +452,47 @@ fn wave32_only(device: *mut c_void) -> bool {
     }
 }
 
+/// Whether `device` runs on an AMD adapter (PCI vendor ID `0x1002`), cached per device pointer.
+fn is_amd_device(device: *mut c_void) -> bool {
+    use windows::Win32::Graphics::Dxgi::*;
+    if device.is_null() {
+        return false;
+    }
+    static CACHE: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+    let key = device as usize;
+    if let Some(&v) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return v;
+    }
+    let amd = unsafe {
+        ID3D12Device::from_raw_borrowed(&device)
+            .and_then(|dev| {
+                let luid = dev.GetAdapterLuid();
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+                let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+                let desc = adapter.GetDesc1().ok()?;
+                Some(desc.VendorId == 0x1002)
+            })
+            .unwrap_or(false)
+    };
+    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, amd);
+    amd
+}
+
+/// Serialize driver `Create*PipelineState` calls on AMD adapters to prevent concurrent compiler
+/// access violations on AMD RDNA4 (`XCL_AMD_SERIAL_PSO=0` disables; `=1` forces on all vendors).
+/// Direct DXIL / HLSL translation still runs fully in parallel across worker threads.
+fn serialize_driver_pso(device: *mut c_void) -> bool {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    match *OVERRIDE.get_or_init(|| match std::env::var("XCL_AMD_SERIAL_PSO").ok().as_deref().map(str::trim) {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        _ => None,
+    }) {
+        Some(v) => v,
+        None => is_amd_device(device),
+    }
+}
+
 /// A wave64 VS / PS may run in 32-lane waves here (`pso::graphics_wave32`: the driver picks
 /// the wave size of graphics shaders): the split flag for VS / PS translation. Unknown
 /// device: assume so.
@@ -1813,9 +1854,88 @@ fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect
     }
 }
 
-/// Whether `pso` runs a translated console compute shader.
-pub fn is_translated_compute(pso: usize) -> bool {
+/// Thread-group dimensions `[x, y, z]` of console compute PSOs (stand-in and real) for
+/// `DispatchX` with `USE_THREAD_DIMENSIONS` (`0x20`).
+static PSO_COMPUTE_THREADS: Mutex<Option<HashMap<usize, [u32; 3]>>> = Mutex::new(None);
+/// Compute PSOs (stand-in and real) that issue `image_bvh*_intersect_ray`.
+static BVH_TRAVERSAL_PSOS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// At least one `DispatchX(..., 0x20)` BVH builder pass succeeded with no failed builder PSOs.
+static BVH_BUILD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// At least one `DispatchX(..., 0x20)` BVH builder PSO failed or stayed pending: gate stays closed.
+static BVH_BUILD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn bvh_gate_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_RT_GATE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether BVH traversal compute shaders (`image_bvh*_intersect_ray`) are allowed to run.
+pub(super) fn bvh_traversal_allowed() -> bool {
+    !bvh_gate_enabled() || (BVH_BUILD_READY.load(Ordering::Acquire) && !BVH_BUILD_FAILED.load(Ordering::Acquire))
+}
+
+/// Whether any BVH builder pass failed (all-or-nothing gate disables further partial builds).
+pub(super) fn bvh_builder_failed() -> bool {
+    bvh_gate_enabled() && BVH_BUILD_FAILED.load(Ordering::Acquire)
+}
+
+pub(super) fn note_bvh_builder_dispatched() {
+    if !BVH_BUILD_FAILED.load(Ordering::Acquire) && !BVH_BUILD_READY.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: BVH builder dispatch ready — enabling RT traversal shaders");
+    }
+}
+
+pub(super) fn note_bvh_builder_failed(pso: usize) {
+    BVH_BUILD_READY.store(false, Ordering::Release);
+    if !BVH_BUILD_FAILED.swap(true, Ordering::AcqRel) {
+        crate::xlog_warn!("D3D12.X: BVH builder PSO {pso:#x} unavailable — holding back partial BVH builds and RT traversal (XCL_RT_GATE=0 to override)");
+    }
+}
+
+pub(super) fn pso_compute_threads(pso: usize) -> Option<[u32; 3]> {
+    if pso == 0 {
+        return None;
+    }
+    PSO_COMPUTE_THREADS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+fn note_compute_threads(pso: usize, cs: &[u8]) {
+    if pso != 0 {
+        if let Some(t) = crate::gpu::recomp::pso::compute_threads(cs) {
+            PSO_COMPUTE_THREADS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, t);
+        }
+    }
+}
+
+fn note_bvh_traversal(pso: usize, cs: &[u8]) {
+    if pso != 0 && crate::gpu::effects::uses_bvh_intersect(cs) {
+        BVH_TRAVERSAL_PSOS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
+fn is_bvh_traversal_pso(pso: usize) -> bool {
+    pso != 0 && BVH_TRAVERSAL_PSOS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+/// Raw check without BVH traversal hold-back (used by `DispatchX` builder passes).
+pub(super) fn is_translated_compute_raw(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+/// Whether `pso` runs a translated console compute shader (holding back BVH traversal shaders
+/// until a full BVH build has succeeded with zero failed builder passes).
+pub fn is_translated_compute(pso: usize) -> bool {
+    if !is_translated_compute_raw(pso) {
+        return false;
+    }
+    if bvh_gate_enabled() && is_bvh_traversal_pso(pso) && !bvh_traversal_allowed() {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            crate::xlog_info!("D3D12.X: holding back BVH traversal compute dispatches until BVH builders succeed (XCL_RT_GATE=0 to disable)");
+        });
+        return false;
+    }
+    true
 }
 
 /// compute pipelines the title made from a console shader that runs untranslated: a background
@@ -1887,6 +2007,12 @@ fn forget_pso(pso: usize) {
     }
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
         m.remove(&pso);
+    }
+    if let Some(m) = PSO_COMPUTE_THREADS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+    if let Some(s) = BVH_TRAVERSAL_PSOS.lock().unwrap().as_mut() {
+        s.remove(&pso);
     }
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
@@ -3844,9 +3970,21 @@ pub fn switch_form_retries() -> u64 {
 /// A driver pipeline call; E_OUTOFMEMORY while this thread translates with heap windows is
 /// noted for `with_switch_fallback`.
 unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    static AMD_DRIVER_PSO_LOCK: Mutex<()> = Mutex::new(());
     let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
-    let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
+    let hr = if injected {
+        E_OUTOFMEMORY
+    } else if serialize_driver_pso(this) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::xlog_info!("D3D12.X: serializing driver Create*PipelineState on AMD adapter (XCL_AMD_SERIAL_PSO=0 to disable)");
+        });
+        let _guard = AMD_DRIVER_PSO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f(this, desc, riid, ppv)
+    } else {
+        f(this, desc, riid, ppv)
+    };
     if hr == E_OUTOFMEMORY && heap {
         HEAP_WINDOW_OOM.with(|o| o.set(true));
     }
@@ -4400,6 +4538,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
             }
+            note_compute_threads(*ppv as usize, cs);
+            note_bvh_traversal(*ppv as usize, cs);
             note_translated_compute(0, ppv);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
@@ -4437,6 +4577,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
+    note_compute_threads(*ppv as usize, cs);
+    note_bvh_traversal(*ppv as usize, cs);
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -5724,6 +5866,17 @@ unsafe fn go_background(
     let key = owned.shaders_key();
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
+    let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::uses_bvh_intersect(b)));
+    if compute {
+        if let OwnedDesc::Compute(_, b) = &owned {
+            if let Some(cs) = b.first() {
+                note_compute_threads(*ppv as usize, cs);
+            }
+        }
+        if bvh_trav {
+            BVH_TRAVERSAL_PSOS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        }
+    }
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5742,6 +5895,9 @@ unsafe fn go_background(
     }
     if image_only {
         super::pso_async::image_only(*ppv as usize);
+    }
+    if bvh_trav {
+        super::pso_async::bvh_traversal(*ppv as usize);
     }
     Some(hr)
 }

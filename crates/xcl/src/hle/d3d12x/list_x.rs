@@ -3068,8 +3068,54 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
     pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
 }
 
+/// `D3D12XBOX_DISPATCH_FLAG_USE_THREAD_DIMENSIONS`: `(x, y, z)` are total thread counts rather
+/// than workgroup counts (used by `XboxBvhBuilder.dll` BVH build passes).
+const DISPATCH_FLAG_USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// Convert `(x, y, z)` thread dimensions into workgroup counts for a compute shader with
+/// `[numthreads(tx, ty, tz)]`. Returns `None` if any thread count is 0.
+pub(crate) fn thread_dims_to_groups(threads: [u32; 3], group_size: [u32; 3]) -> Option<[u32; 3]> {
+    if threads[0] == 0 || threads[1] == 0 || threads[2] == 0 {
+        return None;
+    }
+    Some([
+        threads[0].div_ceil(group_size[0].max(1)),
+        threads[1].div_ceil(group_size[1].max(1)),
+        threads[2].div_ceil(group_size[2].max(1)),
+    ])
+}
+
 /// command list #78 DispatchX(x, y, z, flags)
-pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
+pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    if flags & DISPATCH_FLAG_USE_THREAD_DIMENSIONS != 0 {
+        if super::real::bvh_builder_failed() {
+            return;
+        }
+        let raw_pso = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).map_or(0, |s| s.bound_pso);
+        let resolved = super::pso_async::resolve_wait(raw_pso);
+        if !super::real::is_translated_compute_raw(resolved) || super::pso_async::is_pending(raw_pso) {
+            super::real::note_bvh_builder_failed(raw_pso);
+            return;
+        }
+        let group_size = super::real::pso_compute_threads(raw_pso)
+            .or_else(|| super::real::pso_compute_threads(resolved))
+            .unwrap_or([64, 1, 1]);
+        let Some([gx, gy, gz]) = thread_dims_to_groups([x, y, z], group_size) else {
+            return;
+        };
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: DispatchX USE_THREAD_DIMENSIONS ({x}, {y}, {z}) / {:?} -> groups ({gx}, {gy}, {gz}) ({} dispatches)",
+                group_size,
+                n + 1
+            );
+        }
+        super::real::note_bvh_builder_dispatched();
+        super::bind::dispatch(this, gx, gy, gz);
+        return;
+    }
     super::bind::dispatch(this, x, y, z);
 }
 
@@ -7436,5 +7482,14 @@ mod tests {
             console_heap::unregister(go);
             assert!(got.iter().all(|&v| v == 0xDEAD_BEEF), "the UAV was not cleared: {:x?}", &got[..4]);
         }
+    }
+
+    #[test]
+    fn thread_dims_to_groups_divides_and_ceils_each_axis() {
+        assert_eq!(thread_dims_to_groups([0, 1, 1], [64, 1, 1]), None);
+        assert_eq!(thread_dims_to_groups([64, 1, 1], [64, 1, 1]), Some([1, 1, 1]));
+        assert_eq!(thread_dims_to_groups([70, 1, 1], [64, 1, 1]), Some([2, 1, 1]));
+        assert_eq!(thread_dims_to_groups([1920, 1080, 3], [8, 8, 1]), Some([240, 135, 3]));
+        assert_eq!(thread_dims_to_groups([1, 1, 1], [0, 0, 0]), Some([1, 1, 1]));
     }
 }

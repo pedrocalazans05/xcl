@@ -33,6 +33,8 @@ struct Pending {
     late: std::sync::atomic::AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
     spared: std::sync::atomic::AtomicBool,
+    /// shader issues `image_bvh*_intersect_ray`: held back without blocking until BVH builds succeed
+    bvh_traversal: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
 }
 
@@ -399,6 +401,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         spared: Default::default(),
+        bvh_traversal: Default::default(),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -1145,7 +1148,7 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    if p.spared.load(Ordering::Acquire) {
+    if p.spared.load(Ordering::Acquire) || (p.bvh_traversal.load(Ordering::Acquire) && !super::real::bvh_traversal_allowed()) {
         return resolve_spared(&p, pso);
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
@@ -1227,6 +1230,14 @@ pub fn image_skip() -> bool {
 pub fn image_only(standin: usize) {
     if let Some(p) = entry(standin) {
         p.spared.store(true, Ordering::Release);
+    }
+}
+
+/// The compute pipeline behind stand-in `standin` issues `image_bvh*_intersect_ray`: binds do not
+/// block waiting for it while the BVH builder gate is still closed.
+pub fn bvh_traversal(standin: usize) {
+    if let Some(p) = entry(standin) {
+        p.bvh_traversal.store(true, Ordering::Release);
     }
 }
 
