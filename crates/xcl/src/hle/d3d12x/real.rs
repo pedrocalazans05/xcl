@@ -465,6 +465,20 @@ fn graphics_wave32(device: *mut c_void) -> bool {
     }
 }
 
+/// The device rasterizes conservatively (`D3D12_OPTIONS`' tier). The RX 580 (AMD Polaris) does
+/// not, and its driver refuses every pipeline that asks for it. Unknown device: assume so.
+fn conservative_raster(device: *mut c_void) -> bool {
+    if device.is_null() {
+        return true;
+    }
+    unsafe {
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as _, std::mem::size_of_val(&o) as u32).is_err()
+            || o.ConservativeRasterizationTier != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED
+    }
+}
+
 /// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
@@ -5273,6 +5287,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.GS = bytecode(gs);
     }
     pc_topology_type(&mut copy);
+    pc_conservative_raster(this, &mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
@@ -5552,6 +5567,7 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     pc_topology_type(&mut copy);
+    pc_conservative_raster(this, &mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
@@ -5733,6 +5749,7 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     pc_topology_type(&mut copy);
+    pc_conservative_raster(this, &mut copy);
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     note_fallback("graphics PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
@@ -6586,6 +6603,19 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
     }
+}
+
+/// Conservative rasterization off where `device` has none (`conservative_raster`): the console
+/// always has it, and the RX 580's driver refused the retail title's pipelines that ask for it
+/// (translated, stand-in and fallback alike, E_INVALIDARG). Without it a draw covers the pixels
+/// whose centres its triangles cover.
+unsafe fn pc_conservative_raster(device: *mut c_void, g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    if g.RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF || conservative_raster(device) {
+        return;
+    }
+    g.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: the GPU has no conservative rasterization – pipelines that ask for it are made without it"));
 }
 
 #[cfg(test)]
@@ -7660,6 +7690,80 @@ mod rect_list_pso_tests {
             assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
             assert!(untranslated_stream_desc(desc(&tri), true).is_none());
             assert!(untranslated_stream_desc(desc(&rect), false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod conservative_raster_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    /// A stand-in-like pipeline that asks for conservative rasterization (one render target, the
+    /// dummy VS / PS) on `rs`.
+    fn asking_for_it(rs: &ID3D12RootSignature) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        let d = dummy();
+        let mut g = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+            VS: bytecode(&d.vs),
+            PS: bytecode(&d.ps),
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        g.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.RasterizerState = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_BACK,
+            DepthClipEnable: true.into(),
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+            ..Default::default()
+        };
+        let rt = &mut g.BlendState.RenderTarget[0];
+        (rt.SrcBlend, rt.DestBlend, rt.BlendOp) = (D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD);
+        (rt.SrcBlendAlpha, rt.DestBlendAlpha, rt.BlendOpAlpha) = (D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD);
+        (rt.LogicOp, rt.RenderTargetWriteMask) = (D3D12_LOGIC_OP_NOOP, 15);
+        g
+    }
+
+    /// An unknown device keeps the pipeline's conservative rasterization (as `wave32_only`
+    /// assumes the worst for one, this assumes the console's GPU).
+    #[test]
+    fn an_unknown_device_keeps_conservative_rasterization() {
+        let mut g = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        g.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+        unsafe { pc_conservative_raster(std::ptr::null_mut(), &mut g) };
+        assert_eq!(g.RasterizerState.ConservativeRaster, D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON);
+        assert!(conservative_raster(std::ptr::null_mut()));
+    }
+
+    /// A pipeline that asks for conservative rasterization builds on this GPU once XCL made it
+    /// for the PC: with it where the GPU has it, without it where not (the RX 580's driver
+    /// refused it with E_INVALIDARG before, whatever the shaders).
+    #[test]
+    fn a_pipeline_asking_for_conservative_rasterization_builds() {
+        use crate::gpu::adapter::{candidates, Selector};
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            let sel = Selector::from_env_or("auto");
+            let adapter = if sel == Selector::Warp { factory.EnumWarpAdapter::<IDXGIAdapter1>().ok() } else { candidates(&factory, &sel).into_iter().next().map(|a| a.0) };
+            let Some(dev) = adapter.and_then(|a| crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0).ok()) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
+            let mut ser = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).expect("CreateRootSignature");
+            let mut g = asking_for_it(&rs);
+            pc_conservative_raster(dev.as_raw(), &mut g);
+            let kept = g.RasterizerState.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+            assert_eq!(kept, conservative_raster(dev.as_raw()));
+            let made = dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&g);
+            std::mem::ManuallyDrop::drop(&mut g.pRootSignature);
+            assert!(made.is_ok(), "conservative rasterization {}: {:?}", if kept { "kept" } else { "dropped" }, made.err());
         }
     }
 }
