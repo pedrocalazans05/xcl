@@ -478,15 +478,16 @@ fn is_amd_device(device: *mut c_void) -> bool {
     amd
 }
 
-/// Serialize driver `Create*PipelineState` calls on AMD adapters to prevent concurrent compiler
-/// access violations on AMD RDNA4 (`XCL_AMD_SERIAL_PSO=0` disables; `=1` forces on all vendors).
-/// Direct DXIL / HLSL translation still runs fully in parallel across worker threads.
+/// Serialize driver `Create*PipelineState` calls when explicitly requested (`XCL_AMD_SERIAL_PSO=1`
+/// forces on all vendors; `=auto` serializes on AMD adapters). Default is off because
+/// `big_compile_turn` already gates huge background compiles without blocking urgent title-thread
+/// and cached PSO creation behind multi-minute background shader builds.
 fn serialize_driver_pso(device: *mut c_void) -> bool {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     match *OVERRIDE.get_or_init(|| match std::env::var("XCL_AMD_SERIAL_PSO").ok().as_deref().map(str::trim) {
-        Some("0") => Some(false),
         Some("1") => Some(true),
-        _ => None,
+        Some("auto") => None,
+        _ => Some(false),
     }) {
         Some(v) => v,
         None => is_amd_device(device),
