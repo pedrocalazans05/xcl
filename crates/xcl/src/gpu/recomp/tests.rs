@@ -7415,7 +7415,7 @@ fn split_wave64_reduction_tail_rules() {
         ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
     ]);
     let t = translate(&tail32, &split).unwrap();
-    assert_eq!(t.hlsl.matches("xcl_x_meet() ?").count(), 1 + 3, "1 folded meet + 3 in prelude:\n{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("xcl_x_meet() ?").count(), 1 + 2, "1 folded meet + 2 in prelude:\n{}", t.hlsl);
     assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
 
     // Native wave64 is unchanged
