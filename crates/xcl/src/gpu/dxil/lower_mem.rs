@@ -2107,14 +2107,20 @@ impl Lw {
                 self.write32(&Dst::V(f("VDST")), t);
                 return Ok(());
             }
+            // In wave64 the permute stays in the reader's 32-lane half, as ds_swizzle: lane l reads
+            // (l & 32) | (index & 31) (measured on RDNA2, #772), so the split form needs no exchange.
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
-                let m = if self.wave64 { 63 } else { 31 };
                 let (el, eh) = self.exec_mask();
                 let x = self.addc(a, off16);
                 let x = self.lshrc(x, 2);
-                let l = self.andc(x, m);
-                let r = self.read_lane_any(v, l);
+                let mut l = self.andc(x, 31);
+                if self.wave64 {
+                    let lane = self.lane;
+                    let up = self.andc(lane, 32);
+                    l = self.or(up, l);
+                }
+                let r = self.read_lane_half(v, l);
                 let on = self.lanebit_at(el, eh, l);
                 let z = self.c(0);
                 let t = self.sel(on, r, z);

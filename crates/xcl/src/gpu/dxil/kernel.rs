@@ -560,8 +560,8 @@ impl Lw {
             let Lw { s, ssa, init, .. } = &mut lw;
             ssa.expect_preds(s, Block(0), 0, &mut |s, v| init.load(s, v));
         }
-        // LDS and the split form's exchange slot size (16 words for a coherent s_load_dwordx16,
-        // 32 for ds_bpermute), as the HLSL kernel sizes them
+        // LDS and the split form's exchange slot size (16 words for a coherent s_load_dwordx16),
+        // as the HLSL kernel sizes them
         // geometry mode always has the LDS (the ES ring and the GS output)
         let mut uses_lds = matches!(entry, Entry::Geometry(_));
         let mut slot = 1u32;
@@ -569,9 +569,6 @@ impl Lw {
             let n = d.inst.name;
             if d.enc.name == "ENC_DS" && !matches!(n, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP") {
                 uses_lds = true;
-            }
-            if n == "DS_BPERMUTE_B32" {
-                slot = slot.max(32);
             }
             if d.enc.name == "ENC_SMEM" && ["GLC", "DLC"].iter().any(|f| crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(1)) {
                 let w = match n.rsplit('_').next().unwrap_or("") {
