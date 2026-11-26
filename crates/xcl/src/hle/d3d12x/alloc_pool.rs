@@ -187,23 +187,45 @@ pub fn in_flight(list: usize) -> bool {
 
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || queue.is_null() {
+    if queue.is_null() {
+        return;
+    }
+    if !enabled() {
+        if !lists.is_empty() {
+            super::bind::two_pass_submitted(queue, None, 0, lists);
+        }
         return;
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
     // console lists – so note_resubmits sees them all)
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else {
+        drop(g);
+        if !lists.is_empty() {
+            super::bind::two_pass_submitted(queue, None, 0, lists);
+        }
+        return;
+    };
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else {
+            drop(g);
+            if !lists.is_empty() {
+                super::bind::two_pass_submitted(queue, None, 0, lists);
+            }
+            return;
+        };
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
         if q.Signal(&*f, *v + 1).is_err() {
+            drop(g);
+            if !lists.is_empty() {
+                super::bind::two_pass_submitted(queue, None, 0, lists);
+            }
             return;
         }
         *v += 1;
@@ -216,6 +238,8 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
     }
+    drop(g);
+    super::bind::two_pass_submitted(queue, Some(&fence), value, lists);
 }
 
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
@@ -231,13 +255,14 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (own, made): (bool, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
+        let own = s.backings.get(&alloc).is_none_or(|x| x.free());
         let mut made = Vec::new();
         for b in mine {
             let free = s.backings.get(&b).is_none_or(|x| x.free());
@@ -250,10 +275,14 @@ pub unsafe fn forget(alloc: usize) {
                 made.push(b);
             }
         }
-        made
+        (own, made)
     };
     // (outside the lock: their Release comes back here)
+    if own {
+        super::console_list::allocator_reset(alloc as *mut c_void);
+    }
     for b in made {
+        super::console_list::allocator_reset(b as *mut c_void);
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
 }

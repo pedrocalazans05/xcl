@@ -274,6 +274,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default.
+- Retired two-pass mesh buffers from tracked command lists can be reused once all GPU
+  submissions that used them complete, even while the title still holds the command allocator.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.

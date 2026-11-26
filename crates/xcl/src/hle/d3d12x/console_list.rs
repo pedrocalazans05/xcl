@@ -331,6 +331,7 @@ pub fn allocator_reset(allocator: *mut c_void) {
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
     }
+    super::bind::release_allocator_res(allocator as usize);
 }
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {

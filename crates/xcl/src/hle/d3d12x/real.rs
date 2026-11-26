@@ -771,6 +771,36 @@ fn is_ext(v: usize) -> bool {
     EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
 }
 
+pub(super) unsafe fn list_device(list: *mut c_void) -> Option<ID3D12Device> {
+    if list.is_null() {
+        return None;
+    }
+    type F = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    let f: F = if is_ext(vt(list) as usize) {
+        std::mem::transmute(orig_fn(list, 7))
+    } else {
+        std::mem::transmute(*vt(list).add(7))
+    };
+    let iid = pc_iid(Kind::Device);
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    if f(list, &iid, &mut raw) >= 0 && !raw.is_null() {
+        Some(ID3D12Device::from_raw(raw))
+    } else {
+        None
+    }
+}
+
+pub(super) unsafe fn fence_completed(fence: &ID3D12Fence) -> u64 {
+    const PC_GET_COMPLETED_VALUE: usize = 8;
+    let p = fence.as_raw();
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = if is_ext(vt(p) as usize) {
+        std::mem::transmute(orig_fn(p, PC_GET_COMPLETED_VALUE))
+    } else {
+        std::mem::transmute(*vt(p).add(PC_GET_COMPLETED_VALUE))
+    };
+    f(p)
+}
+
 fn kind_of(ext: usize) -> Option<Kind> {
     CLASSES.lock().unwrap().iter().find(|c| c.ext == ext).map(|c| c.kind)
 }
