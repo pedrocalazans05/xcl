@@ -11,9 +11,11 @@
 //! entry    = length u32, check u32 (the low half of fnv64 of the payload), payload
 //! payload  = 1 key u64 shaders [u64; 5] state input*      a pipeline
 //!          | 2 key u64 bytes                              a shader (preparation job files only)
-//! key      = `real::shaders_key` of the set (as `used-pipelines.txt` has it); in a shader entry
+//!          | 3 key u64 shaders [u64; 2] layout state     a mesh pipeline stream
+//! key      = `real::shaders_key` of the set, in mesh then PS order for mesh; in a shader entry,
 //!            `real::shader_key` of it
-//! shaders  = `real::shader_key` of the VS, PS, DS, HS, GS (0: none)
+//! shaders  = `real::shader_key` of VS, PS, DS, HS, GS, or mesh, PS (0: none)
+//! layout   = subobject count (u8), then subobject types in stream order (u8 each)
 //! state    = every field of the description but its pointers, in `state`'s order (varints)
 //! input    = count, then each element's semantic name (length, bytes), index, format, slot,
 //!            offset, class, step rate (varints)
@@ -34,11 +36,13 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Graphics::Direct3D12::*;
 
 const MAGIC: &[u8; 8] = b"XCLGFXP\0";
-/// The layout of an entry: a change makes every file of the older one read as none.
+/// The file format and existing entry layouts. Optional new tags keep earlier entries readable.
 const VERSION: u32 = 1;
 const HEADER: usize = 12;
 const PIPELINE: u8 = 1;
 const SHADER: u8 = 2;
+const MESH_PIPELINE: u8 = 3;
+const MAX_MESH_LAYOUT: usize = 14; // root, mesh (MS or AS), PS, and eleven scalar state types
 
 /// The records of this cache (beside the DXIL cache, as `used-pipelines.txt`).
 pub(crate) fn path() -> PathBuf {
@@ -84,6 +88,12 @@ impl Reader<'_> {
     fn u32var(&mut self) -> Option<u32> {
         self.var().and_then(|v| u32::try_from(v).ok())
     }
+    fn bounded_var(&mut self, max: u32) -> Option<u32> {
+        let before = self.0.len();
+        let v = self.u32var()?;
+        let bits = (u32::BITS - v.leading_zeros()).max(1);
+        (before - self.0.len() == bits.div_ceil(7) as usize && v <= max).then_some(v)
+    }
     fn u64(&mut self) -> Option<u64> {
         let (b, rest) = self.0.split_at_checked(8)?;
         self.0 = rest;
@@ -100,25 +110,25 @@ impl Reader<'_> {
 /// cached blob), each as a u32 handed to `f`, which may change it: one order for writing and
 /// reading. What the title's translated pipeline is made of beside its shaders
 /// (`real::graphics_blob_key` hashes the same).
-fn state(d: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, f: &mut dyn FnMut(&mut u32)) {
+fn state(d: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, f: &mut dyn FnMut(&mut u32, u32)) {
     macro_rules! int {
         ($x:expr) => {{
             let mut v = $x as u32;
-            f(&mut v);
+            f(&mut v, u32::MAX);
             $x = v as i32;
         }};
     }
     macro_rules! byte {
         ($x:expr) => {{
             let mut v = $x as u32;
-            f(&mut v);
+            f(&mut v, u8::MAX.into());
             $x = v as u8;
         }};
     }
     macro_rules! float {
         ($x:expr) => {{
             let mut v = $x.to_bits();
-            f(&mut v);
+            f(&mut v, u32::MAX);
             $x = f32::from_bits(v);
         }};
     }
@@ -137,7 +147,7 @@ fn state(d: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, f: &mut dyn FnMut(&mut u32)
         int!(rt.LogicOp.0);
         byte!(rt.RenderTargetWriteMask);
     }
-    f(&mut d.SampleMask);
+    f(&mut d.SampleMask, u32::MAX);
     let r = &mut d.RasterizerState;
     int!(r.FillMode.0);
     int!(r.CullMode.0);
@@ -148,7 +158,7 @@ fn state(d: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, f: &mut dyn FnMut(&mut u32)
     int!(r.DepthClipEnable.0);
     int!(r.MultisampleEnable.0);
     int!(r.AntialiasedLineEnable.0);
-    f(&mut r.ForcedSampleCount);
+    f(&mut r.ForcedSampleCount, u32::MAX);
     int!(r.ConservativeRaster.0);
     let z = &mut d.DepthStencilState;
     int!(z.DepthEnable.0);
@@ -165,14 +175,14 @@ fn state(d: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, f: &mut dyn FnMut(&mut u32)
     }
     int!(d.IBStripCutValue.0);
     int!(d.PrimitiveTopologyType.0);
-    f(&mut d.NumRenderTargets);
+    f(&mut d.NumRenderTargets, 8);
     for format in &mut d.RTVFormats {
         int!(format.0);
     }
     int!(d.DSVFormat.0);
-    f(&mut d.SampleDesc.Count);
-    f(&mut d.SampleDesc.Quality);
-    f(&mut d.NodeMask);
+    f(&mut d.SampleDesc.Count, u32::MAX);
+    f(&mut d.SampleDesc.Quality, u32::MAX);
+    f(&mut d.NodeMask, u32::MAX);
     int!(d.Flags.0);
 }
 
@@ -187,7 +197,7 @@ pub(crate) unsafe fn encode(key: u64, shaders: [u64; 5], d: &D3D12_GRAPHICS_PIPE
     }
     // (a copy for `state`, which takes the fields by `&mut`; its pointers are not used)
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
-    state(&mut copy, &mut |v| put_var(&mut out, *v as u64));
+    state(&mut copy, &mut |v, _| put_var(&mut out, *v as u64));
     let il = &d.InputLayout;
     let elems = if il.NumElements > 0 && !il.pInputElementDescs.is_null() { std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize) } else { &[] };
     put_var(&mut out, elems.len() as u64);
@@ -200,6 +210,73 @@ pub(crate) unsafe fn encode(key: u64, shaders: [u64; 5], d: &D3D12_GRAPHICS_PIPE
         }
     }
     out
+}
+
+fn valid_mesh_layout(shaders: [u64; 2], layout: &[u32]) -> bool {
+    if shaders[0] == 0 || layout.len() > MAX_MESH_LAYOUT {
+        return false;
+    }
+    let mut seen = 0u32;
+    for &id in layout {
+        match D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(id as i32) {
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS => {}
+            _ => return false,
+        }
+        let bit = 1 << id;
+        if seen & bit != 0 {
+            return false;
+        }
+        seen |= bit;
+    }
+    let has = |kind: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| seen & (1 << kind.0) != 0;
+    (has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) != has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS))
+        && has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) == (shaders[1] != 0)
+}
+
+/// A mesh stream entry with shader keys in mesh, PS order and subobjects in their original order.
+pub(crate) fn encode_mesh(key: u64, shaders: [u64; 2], layout: &[u32], d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<Vec<u8>> {
+    if key == 0 || !valid_mesh_layout(shaders, layout) || d.NumRenderTargets > 8 {
+        return None;
+    }
+    let mut values = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        BlendState: d.BlendState,
+        SampleMask: d.SampleMask,
+        RasterizerState: d.RasterizerState,
+        DepthStencilState: d.DepthStencilState,
+        IBStripCutValue: d.IBStripCutValue,
+        PrimitiveTopologyType: d.PrimitiveTopologyType,
+        NumRenderTargets: d.NumRenderTargets,
+        RTVFormats: d.RTVFormats,
+        DSVFormat: d.DSVFormat,
+        SampleDesc: d.SampleDesc,
+        NodeMask: d.NodeMask,
+        Flags: d.Flags,
+        ..Default::default()
+    };
+    let mut out = Vec::with_capacity(256);
+    out.push(MESH_PIPELINE);
+    out.extend_from_slice(&key.to_le_bytes());
+    for shader in shaders {
+        out.extend_from_slice(&shader.to_le_bytes());
+    }
+    out.push(layout.len() as u8);
+    out.extend(layout.iter().map(|&id| id as u8));
+    state(&mut values, &mut |v, _| put_var(&mut out, (*v).into()));
+    Some(out)
 }
 
 /// A shader entry (the preparation's job files): `bytes`, of `real::shader_key` `key`.
@@ -241,9 +318,46 @@ impl Record {
     }
 }
 
+pub(crate) struct MeshRecord {
+    pub key: u64,
+    pub shaders: [u64; 2],
+    pub layout: Vec<u32>,
+    desc: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>,
+}
+
+// The decoder starts with null pointers and only fills scalar fields. The descriptor is immutable.
+unsafe impl Send for MeshRecord {}
+unsafe impl Sync for MeshRecord {}
+
+impl MeshRecord {
+    pub(crate) fn state(&self) -> &D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        &self.desc
+    }
+}
+
 pub(crate) enum Entry {
     Pipeline(Record),
+    MeshPipeline(MeshRecord),
     Shader(u64, Vec<u8>),
+}
+
+fn decode_mesh(key: u64, mut r: Reader<'_>) -> Option<MeshRecord> {
+    let shaders = [r.u64()?, r.u64()?];
+    let n = *r.bytes(1)?.first()? as usize;
+    if key == 0 || n > MAX_MESH_LAYOUT {
+        return None;
+    }
+    let layout: Vec<u32> = r.bytes(n)?.iter().map(|&id| id.into()).collect();
+    if !valid_mesh_layout(shaders, &layout) {
+        return None;
+    }
+    let mut desc = Box::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>::default();
+    let mut valid = true;
+    state(&mut desc, &mut |v, max| match r.bounded_var(max) {
+        Some(x) => *v = x,
+        None => valid = false,
+    });
+    (valid && r.0.is_empty()).then_some(MeshRecord { key, shaders, layout, desc })
 }
 
 /// The entry of `payload` (None: not one this version writes).
@@ -254,6 +368,9 @@ pub(crate) fn decode(payload: &[u8]) -> Option<Entry> {
     if tag == SHADER {
         return Some(Entry::Shader(key, r.0.to_vec()));
     }
+    if tag == MESH_PIPELINE {
+        return decode_mesh(key, r).map(Entry::MeshPipeline);
+    }
     if tag != PIPELINE {
         return None;
     }
@@ -263,7 +380,7 @@ pub(crate) fn decode(payload: &[u8]) -> Option<Entry> {
     }
     let mut desc: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC> = Box::new(unsafe { std::mem::zeroed() });
     let mut short = false;
-    state(&mut desc, &mut |v| match r.u32var() {
+    state(&mut desc, &mut |v, _| match r.u32var() {
         Some(x) => *v = x,
         None => short = true,
     });
@@ -578,7 +695,78 @@ mod tests {
         let payload = unsafe { encode(9, [9, 0, 0, 0, 0], &described()) };
         assert!(decode(&payload[..payload.len() - 1]).is_none(), "cut short");
         assert!(decode(&[payload.as_slice(), &[0]].concat()).is_none(), "a byte too many");
-        assert!(decode(&[3, 0, 0, 0, 0, 0, 0, 0, 0]).is_none(), "another kind of entry");
+        assert!(decode(&[u8::MAX, 0, 0, 0, 0, 0, 0, 0, 0]).is_none(), "another kind of entry");
+    }
+
+    #[test]
+    fn a_mesh_entry_preserves_moved_shader_slot_order_and_state() {
+        let layout = [
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS,
+        ].map(|kind| kind.0 as u32);
+        let shaders = [0x13, 0x27];
+        let mut desc = described();
+        let ps = b"pixel";
+        desc.PS = D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() };
+        let payload = encode_mesh(0x1234, shaders, &layout, &desc).unwrap();
+        let Some(Entry::MeshPipeline(record)) = decode(&payload) else { panic!("expected a mesh entry") };
+        assert_eq!((record.key, record.shaders), (0x1234, shaders));
+        assert_eq!(record.layout, layout);
+        assert_eq!(record.state().RasterizerState.DepthBias, desc.RasterizerState.DepthBias);
+        assert_eq!(record.state().RTVFormats, desc.RTVFormats);
+        assert!(record.state().PS.pShaderBytecode.is_null());
+        assert_eq!(encode_mesh(record.key, record.shaders, &record.layout, record.state()).unwrap(), payload);
+    }
+
+    #[test]
+    fn mesh_entries_require_supported_unique_layout_and_exact_payload() {
+        let ms = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32;
+        let moved = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32;
+        let ps = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32;
+        let input = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32;
+        let d = described();
+        for layout in [vec![], vec![ms, moved], vec![ms, ms], vec![ms, ps], vec![ms, input]] {
+            assert!(encode_mesh(1, [1, 0], &layout, &d).is_none(), "unsupported layout {layout:?}");
+        }
+        assert!(encode_mesh(1, [1, 2], &[ms], &d).is_none());
+        assert!(encode_mesh(1, [0, 0], &[ms], &d).is_none());
+        let payload = encode_mesh(1, [1, 0], &[ms], &d).unwrap();
+        assert!(decode(&payload[..payload.len() - 1]).is_none());
+        assert!(decode(&[payload.as_slice(), &[0]].concat()).is_none());
+
+        let count_at = 1 + 3 * std::mem::size_of::<u64>();
+        let mut invalid = payload.clone();
+        invalid[count_at] = MAX_MESH_LAYOUT as u8 + 1;
+        assert!(decode(&invalid).is_none());
+        invalid[count_at] = 1;
+        invalid[count_at + 1] = input as u8;
+        assert!(decode(&invalid).is_none());
+        let state_at = count_at + 2;
+        let overlong = [&payload[..state_at], &[0x81, 0], &payload[state_at + 1..]].concat();
+        assert!(decode(&overlong).is_none());
+    }
+
+    #[test]
+    fn legacy_pipeline_and_mesh_entries_share_version_one_history() {
+        let dir = directory("mesh-version-one");
+        let path = dir.0.join("records.bin");
+        let legacy = unsafe { encode(3, [3, 0, 0, 0, 0], &described()) };
+        let shader = shader_entry(5, b"mesh");
+        let mesh = encode_mesh(5, [5, 0], &[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32], &described()).unwrap();
+        let mut writer = Writer::open(&path, 1 << 20).unwrap();
+        writer.add(&legacy).unwrap();
+        writer.add(&mesh).unwrap();
+        writer.add(&shader).unwrap();
+        drop(writer);
+        assert_eq!(&std::fs::read(&path).unwrap()[8..HEADER], &1u32.to_le_bytes());
+        assert_eq!(read(&path), vec![legacy.clone(), mesh.clone(), shader.clone()]);
+        assert_eq!(pipeline(&legacy).key, 3);
+        assert!(matches!(decode(&mesh), Some(Entry::MeshPipeline(_))));
+        assert!(matches!(decode(&shader), Some(Entry::Shader(5, _))));
     }
 
     /// Written, read back in order, each entry once; a file cut short in its last entry keeps the

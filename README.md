@@ -242,10 +242,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   five seconds without progress counts as a stall, and the window shows when the last one ended.
   XCL prepares supported shader stages and compute pipelines, including
   split pieces and their whole fallback. Graphics pipelines are created during play the first
-  time; the ones a run used are recorded with their state (`used-graphics-pipelines.bin` beside
-  the shader cache, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
-  on the next launch, with their driver blobs kept, so the title makes them from those in
-  milliseconds. `XCL_PREPARE_GRAPHICS=0` leaves that pass out. Later launches reuse matching cache entries.
+  time. The startup history records supported graphics descriptors and two-pass mesh streams with
+  their state (`used-graphics-pipelines.bin` beside the shader cache, capped by `XCL_GFX_RECORDS_MB`
+  at 64 MB by default). On the next launch, XCL builds the recorded pipelines before the title starts
+  and keeps their driver blobs for reuse. `XCL_PREPARE_GRAPHICS=0` leaves that pass out.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
   the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
 - For compute shaders that XCL can split, the runtime first tries the saved driver blob for

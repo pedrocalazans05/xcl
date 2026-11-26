@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
+use crate::hle::d3d12x::gfx_records;
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -1900,15 +1901,19 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
 /// part (`gfx_records`' format, with the shaders it needs). A failure is noted and the title
 /// starts all the same: it builds what is missing itself.
 fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress: &LaunchPreparation) -> Result<(), String> {
-    use crate::hle::d3d12x::gfx_records::{self, Entry};
     let t0 = std::time::Instant::now();
     let payloads = gfx_records::read(&gfx_records::path());
-    let records: Vec<(Vec<u8>, gfx_records::Record)> = payloads.into_iter().filter_map(|p| match gfx_records::decode(&p) { Some(Entry::Pipeline(r)) => Some((p, r)), _ => None }).collect();
+    let records: Vec<_> = payloads.into_iter().filter_map(|payload| {
+        let record = GraphicsHistoryRecord::from_entry(gfx_records::decode(&payload)?)?;
+        Some((payload, record))
+    }).collect();
     if records.is_empty() {
         crate::xlog_info!("Shader preparation: no graphics pipelines of an earlier run to build");
         return Ok(());
     }
-    let shaders = shaders_by_key(inputs, records.iter().flat_map(|(_, r)| r.shaders).filter(|&k| k != 0).collect(), progress);
+    let wanted = records.iter().flat_map(|(_, record)| record.identity().1.iter().copied())
+        .filter(|&key| key != 0).collect();
+    let shaders = shaders_by_key(inputs, wanted, progress);
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
     let (buildable, missing) = buildable(records.iter().map(|(_, r)| r), &shaders);
     if missing != 0 {
@@ -1926,7 +1931,7 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
         let mut keys = HashSet::new();
         for &k in &part {
             w.add(&records[k].0).map_err(|e| format!("{}: {e}", path.display()))?;
-            keys.extend(records[k].1.shaders.into_iter().filter(|&s| s != 0));
+            keys.extend(records[k].1.identity().1.iter().copied().filter(|&key| key != 0));
         }
         for key in keys {
             w.add(&gfx_records::shader_entry(key, &shaders[&key])).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1976,14 +1981,37 @@ fn shaders_by_key(inputs: &[Input], wanted: HashSet<u64>, progress: &LaunchPrepa
     found.into_inner().unwrap()
 }
 
+enum GraphicsHistoryRecord {
+    Legacy(gfx_records::Record),
+    Mesh(gfx_records::MeshRecord),
+}
+
+impl GraphicsHistoryRecord {
+    fn from_entry(entry: gfx_records::Entry) -> Option<Self> {
+        match entry {
+            gfx_records::Entry::Pipeline(record) => Some(Self::Legacy(record)),
+            gfx_records::Entry::MeshPipeline(record) => Some(Self::Mesh(record)),
+            gfx_records::Entry::Shader(..) => None,
+        }
+    }
+
+    fn identity(&self) -> (u64, &[u64]) {
+        match self {
+            Self::Legacy(record) => (record.key, &record.shaders),
+            Self::Mesh(record) => (record.key, &record.shaders),
+        }
+    }
+}
+
 /// The records (by their index) whose shaders are all in `shaders` and make their set's key, and
 /// how many are not.
-fn buildable<'a>(records: impl Iterator<Item = &'a crate::hle::d3d12x::gfx_records::Record>, shaders: &std::collections::HashMap<u64, Vec<u8>>) -> (Vec<usize>, usize) {
+fn buildable<'a>(records: impl Iterator<Item = &'a GraphicsHistoryRecord>, shaders: &HashMap<u64, Vec<u8>>) -> (Vec<usize>, usize) {
     let (mut ok, mut missing) = (Vec::new(), 0);
-    for (i, r) in records.enumerate() {
-        let blobs: Option<Vec<Vec<u8>>> = r.shaders.iter().filter(|&&k| k != 0).map(|k| shaders.get(k).cloned()).collect();
+    for (i, record) in records.enumerate() {
+        let (key, keys) = record.identity();
+        let blobs: Option<Vec<&[u8]>> = keys.iter().filter(|&&k| k != 0).map(|k| shaders.get(k).map(Vec::as_slice)).collect();
         match blobs {
-            Some(b) if crate::hle::d3d12x::real::shaders_key(&b) == r.key => ok.push(i),
+            Some(blobs) if crate::hle::d3d12x::real::shader_set_key(blobs.iter().copied()) == key => ok.push(i),
             _ => missing += 1,
         }
     }
@@ -2000,11 +2028,11 @@ fn graphics_summary(line: &str) -> Option<[usize; 4]> {
 }
 
 /// `xcl shaders <job> --graphics-records` (a worker of `graphics_in_workers`): the graphics
-/// pipelines of a job file built as the title builds them (`real::prepare_graphics`), with the
+/// pipelines of a job file built as the title builds them, with the
 /// title's memory windows (`windows`) and on its adapter (`XCL_ADAPTER`), `XCL_PIPELINE_THREADS`
 /// at a time. A progress line a pipeline, then the summary `graphics_summary` reads.
 fn graphics_worker(job: &Path, windows: u32) -> i32 {
-    use crate::hle::d3d12x::gfx_records::{self, Entry};
+    use crate::hle::d3d12x::real;
     end_with_parent();
     // (no title memory here: its windows are given)
     crate::gpu::uma::leave_out();
@@ -2014,13 +2042,13 @@ fn graphics_worker(job: &Path, windows: u32) -> i32 {
     let mut records = Vec::new();
     for p in gfx_records::read(job) {
         match gfx_records::decode(&p) {
-            Some(Entry::Pipeline(r)) => records.push(r),
-            Some(Entry::Shader(k, b)) => { shaders.insert(k, b); }
+            Some(gfx_records::Entry::Shader(key, code)) => { shaders.insert(key, code); }
+            Some(entry) => records.extend(GraphicsHistoryRecord::from_entry(entry)),
             None => {}
         }
     }
     let device = match Pipelines::for_adapter("auto") {
-        Ok(p) => crate::hle::d3d12x::real::prepare_device(p.dev),
+        Ok(p) => real::prepare_device(p.dev),
         Err(e) => { eprintln!("xcl shaders: no pipeline device: {e}"); return 2; }
     };
     let n = records.len();
@@ -2032,17 +2060,24 @@ fn graphics_worker(job: &Path, windows: u32) -> i32 {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(r) = records.get(i) else { break };
-                let code = r.shaders.map(|k| shaders.get(&k).map(Vec::as_slice));
-                let desc = r.desc(code);
+                let code = |key| shaders.get(&key).map(Vec::as_slice);
                 // (a pipeline that panics fails; the others are built)
-                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::hle::d3d12x::real::prepare_graphics(device, &desc) })).unwrap_or(false);
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r {
+                    GraphicsHistoryRecord::Legacy(record) => {
+                        let desc = record.desc(record.shaders.map(code));
+                        unsafe { real::prepare_graphics(device, &desc) }
+                    }
+                    GraphicsHistoryRecord::Mesh(record) => {
+                        unsafe { real::replay_mesh_record(device, record, record.shaders.map(code)).is_ok() }
+                    }
+                })).unwrap_or(false);
                 if ok { made.fetch_add(1, Ordering::Relaxed); } else { failed.fetch_add(1, Ordering::Relaxed); }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
             });
         }
     });
-    let (hits, _, stored) = crate::hle::d3d12x::real::driver_cache_stats();
+    let (hits, _, stored) = real::driver_cache_stats();
     eprintln!("graphics pipelines: {} made, {} failed; driver blobs: {hits} from disk, {stored} kept", made.into_inner(), failed.into_inner());
     0
 }
@@ -2642,25 +2677,33 @@ mod tests {
     /// other shaders under its keys, is left out.
     #[test]
     fn a_graphics_record_is_built_only_with_its_own_shaders() {
-        use crate::hle::d3d12x::gfx_records::{decode, encode, Entry};
+        use crate::hle::d3d12x::gfx_records::{decode, encode, encode_mesh};
         use crate::hle::d3d12x::real::{shader_key, shaders_key};
-        let (vs, ps) = (b"vertex".to_vec(), b"pixel".to_vec());
-        let record = |key: u64, shaders: [u64; 5]| {
-            let d = windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
-            match decode(&unsafe { encode(key, shaders, &d) }) {
-                Some(Entry::Pipeline(r)) => r,
-                _ => unreachable!(),
-            }
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+        };
+        let (vs, ps, ms) = (b"vertex".to_vec(), b"pixel".to_vec(), b"mesh".to_vec());
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        let record = |key, shaders| {
+            GraphicsHistoryRecord::from_entry(decode(&unsafe { encode(key, shaders, &desc) }).unwrap()).unwrap()
         };
         let both = [shader_key(&vs), shader_key(&ps), 0, 0, 0];
+        let mesh = |key, shaders| {
+            let layout = [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32];
+            let payload = encode_mesh(key, shaders, &layout, &desc).unwrap();
+            GraphicsHistoryRecord::from_entry(decode(&payload).unwrap()).unwrap()
+        };
         let records = [
             record(shaders_key(&[vs.clone(), ps.clone()]), both),
             record(shaders_key(&[vs.clone()]), [shader_key(&vs), 0, 0, 0, 0]),
             record(shaders_key(&[vs.clone(), b"other".to_vec()]), [shader_key(&vs), shader_key(b"other"), 0, 0, 0]),
             record(shaders_key(&[ps.clone(), vs.clone()]), both),
+            mesh(shaders_key(&[ms.clone(), ps.clone()]), [shader_key(&ms), shader_key(&ps)]),
+            mesh(shaders_key(&[ps.clone(), ms.clone()]), [shader_key(&ms), shader_key(&ps)]),
         ];
-        let shaders = std::collections::HashMap::from([(shader_key(&vs), vs.clone()), (shader_key(&ps), ps.clone())]);
-        assert_eq!(buildable(records.iter(), &shaders), (vec![0, 1], 2));
+        let shaders = HashMap::from([(shader_key(&vs), vs), (shader_key(&ps), ps), (shader_key(&ms), ms)]);
+        assert_eq!(buildable(records.iter(), &shaders), (vec![0, 1, 4], 3));
     }
 
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the

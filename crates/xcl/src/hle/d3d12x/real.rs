@@ -5826,6 +5826,10 @@ pub(crate) fn shader_key(blob: &[u8]) -> u64 {
 }
 
 pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+    shader_set_key(blobs.iter().map(Vec::as_slice))
+}
+
+pub(crate) fn shader_set_key<'a>(blobs: impl IntoIterator<Item = &'a [u8]>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
         h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -5871,8 +5875,11 @@ impl OwnedDesc {
     }
 
     /// A graphics pipeline's entry for the next run's preparation (`gfx_records`), of the set
-    /// `key` whose shaders' keys are `parts`; None for any other.
+    /// `key` whose shaders' keys are `parts`, or an eligible mesh stream's entry.
     unsafe fn record(&self, key: u64, parts: &[u64]) -> Option<Vec<u8>> {
+        if let OwnedDesc::Stream(_, stream, _) = self {
+            return record_mesh_stream(stream);
+        }
         let OwnedDesc::Graphics(d, ..) = self else { return None };
         // (`own_graphics` copied the stages it has, in this order)
         let mut parts = parts.iter();
@@ -6457,6 +6464,120 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
+/// Keep the source states the mesh translator will use again during preparation.
+unsafe fn record_mesh_stream(stream: &[u8]) -> Option<Vec<u8>> {
+    let subs = stream_subobjects(stream)?;
+    let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+    let mut layout = Vec::with_capacity(subs.len());
+    let (mut ms, mut amplification, mut ps) = (None, None, None);
+    let (mut seen, mut size) = (0u32, 0usize);
+
+    fn value<T: Copy>(payload: &[u8]) -> Option<T> {
+        (payload.len() == std::mem::size_of::<T>()).then(|| unsafe { std::ptr::read_unaligned(payload.as_ptr().cast()) })
+    }
+
+    for (ty, payload) in subs {
+        let (_, align) = super::null::subobject_payload(ty)?;
+        size += (align + payload.len() + 7) & !7;
+        let bit = 1u32 << ty;
+        if seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
+        match ty {
+            0 => {} // The translator supplies its own root signature.
+            19 => continue, // The title's cache blob is never an input to translation.
+            2 | 24 | 25 if payload.iter().all(|&b| b == 0) => continue,
+            2 => ps = Some(payload_shader(payload)?),
+            24 => amplification = Some(payload_shader(payload)?),
+            25 => ms = Some(payload_shader(payload)?),
+            8 => desc.BlendState = value(payload)?,
+            9 => desc.SampleMask = value(payload)?,
+            10 => desc.RasterizerState = value(payload)?,
+            11 => desc.DepthStencilState = value(payload)?,
+            13 => desc.IBStripCutValue = value(payload)?,
+            14 => desc.PrimitiveTopologyType = value(payload)?,
+            15 => {
+                let rt: D3D12_RT_FORMAT_ARRAY = value(payload)?;
+                if rt.NumRenderTargets > 8 {
+                    return None;
+                }
+                desc.NumRenderTargets = rt.NumRenderTargets;
+                desc.RTVFormats = rt.RTFormats;
+            }
+            16 => desc.DSVFormat = value(payload)?,
+            17 => desc.SampleDesc = value(payload)?,
+            18 => desc.NodeMask = value(payload)?,
+            20 => desc.Flags = value(payload)?,
+            _ => return None,
+        }
+        layout.push(ty);
+    }
+    if size != stream.len() || (ms.is_some() && amplification.is_some()) {
+        return None;
+    }
+    let ms = ms.or(amplification)?;
+    if !crate::gpu::xbox::parse(ms).is_some_and(|shader| shader.stage == "MS") {
+        return None;
+    }
+    let shaders = [shader_key(ms), ps.map_or(0, shader_key)];
+    let key = shader_set_key(std::iter::once(ms).chain(ps));
+    super::gfx_records::encode_mesh(key, shaders, &layout, &desc)
+}
+
+/// Build both recorded mesh passes on the adopted device from `prepare_device`.
+/// Respects the device's `has_mesh_shaders` (`uses_vs` VS pass-through fallback on GPUs
+/// without hardware mesh shaders, such as RX 580 Polaris) and `wave32_only` / `wave64_only`.
+///
+/// # Safety
+/// `device` must be the live adopted device returned from `prepare_device`.
+pub(crate) unsafe fn replay_mesh_record(
+    device: usize,
+    record: &super::gfx_records::MeshRecord,
+    shaders: [Option<&[u8]>; 2],
+) -> Result<(), String> {
+    let [Some(ms), ps] = shaders else { return Err("mesh shader missing from the job".into()) };
+    if record.shaders != [shader_key(ms), ps.map_or(0, shader_key)] ||
+        record.key != shader_set_key(std::iter::once(ms).chain(ps))
+    {
+        return Err("mesh shaders do not match the recorded keys".into());
+    }
+
+    let d = record.state();
+    let mut stream = StreamOut::default();
+    for &ty in &record.layout {
+        let subobject = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(ty as i32);
+        match ty {
+            0 => stream.put(subobject, &std::ptr::null::<c_void>()),
+            2 => stream.shader(subobject, ps.ok_or("pixel shader missing from the job")?),
+            24 | 25 => stream.shader(subobject, ms),
+            8 => stream.put(subobject, &d.BlendState),
+            9 => stream.put(subobject, &d.SampleMask),
+            10 => stream.put(subobject, &d.RasterizerState),
+            11 => stream.put(subobject, &d.DepthStencilState),
+            13 => stream.put(subobject, &d.IBStripCutValue),
+            14 => stream.put(subobject, &d.PrimitiveTopologyType),
+            15 => stream.put(subobject, &D3D12_RT_FORMAT_ARRAY { RTFormats: d.RTVFormats, NumRenderTargets: d.NumRenderTargets }),
+            16 => stream.put(subobject, &d.DSVFormat),
+            17 => stream.put(subobject, &d.SampleDesc),
+            18 => stream.put(subobject, &d.NodeMask),
+            20 => stream.put(subobject, &d.Flags),
+            _ => return Err(format!("unsupported mesh subobject {ty}")),
+        }
+    }
+    let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+    let mut out = std::ptr::null_mut();
+    let hr = unsafe {
+        translated_mesh_stream(device as *mut c_void, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut out)
+    };
+    super::pso_async::release(out as usize);
+    match hr {
+        Some(hr) if hr >= 0 && !out.is_null() => Ok(()),
+        Some(hr) => Err(format!("mesh pipeline replay failed ({hr:#x})")),
+        None => Err("mesh pipeline record could not be translated".into()),
+    }
+}
+
 /// The passthrough mesh or vertex shader emits triangles for both translated MS and GS pipelines.
 fn two_pass_mesh_stream(rs: *mut c_void, shader: &[u8], ps: Option<&[u8]>, uses_vs: bool) -> StreamOut {
     let mut out = StreamOut::default();
@@ -6661,21 +6782,30 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     };
+    let preparing = PREPARING.load(Ordering::Relaxed);
     if let Some(key) = gkey {
         if greused {
             if let Some(blob) = gcached.filter(|_| gfrom_disk) {
-                remember_graphics_blob(key, blob);
+                if !preparing {
+                    remember_graphics_blob(key, blob);
+                }
                 driver_cache::note(true, None);
             }
         } else {
             let slow = driver_cache::worth_keeping(gin_driver);
-            if slow || mesh_bytes >= COMPUTE_BLOB_MIN_DXIL {
+            if preparing || slow || mesh_bytes >= COMPUTE_BLOB_MIN_DXIL {
                 let blob = graphics_blob(key).or_else(|| read_pso_cached_blob(mesh_pso.as_raw()).map(std::sync::Arc::new));
                 if let Some(blob) = blob {
-                    if let Some(path) = gdisk.as_deref().filter(|_| slow) {
-                        driver_cache::keep(path, &blob, gin_driver);
+                    if let Some(path) = gdisk.as_deref() {
+                        if preparing {
+                            driver_cache::write(path, &blob);
+                        } else if slow {
+                            driver_cache::keep(path, &blob, gin_driver);
+                        }
                     }
-                    remember_graphics_blob(key, blob);
+                    if !preparing {
+                        remember_graphics_blob(key, blob);
+                    }
                 }
             }
         }
@@ -6719,9 +6849,15 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
+        if preparing {
+            if let (Some(p), Some(b)) = (cdisk.as_deref(), read_pso_cached_blob(compute)) {
+                driver_cache::write(p, &b);
+            }
+        } else {
+            keep_compute_blob(ckey, compute, tp.cs.len());
+            if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+                driver_cache::keep(p, &b, cin_driver);
+            }
         }
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
