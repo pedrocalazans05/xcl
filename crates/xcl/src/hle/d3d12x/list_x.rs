@@ -2346,7 +2346,7 @@ unsafe fn make_copy_scratch(list: *mut c_void, bytes: u64) -> Option<ID3D12Resou
     device_of(list)?
         .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b)
         .ok()?;
-    b
+    crate::hle::d3d12x::resource_census::tracked(b, "copy scratch")
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
@@ -2390,7 +2390,7 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
         &mut b,
     )
     .ok()?;
-    let b = b?;
+    let b = crate::hle::d3d12x::resource_census::tracked(b, "fill pattern")?;
     let mut p: *mut c_void = std::ptr::null_mut();
     b.Map(0, None, Some(&mut p)).ok()?;
     for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
@@ -2500,7 +2500,7 @@ unsafe fn ensure_timestamp_readback(dev: &ID3D12Device, pool: &mut TimestampPool
     };
     let mut rb: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).ok()?;
-    let rb = rb?;
+    let rb = crate::hle::d3d12x::resource_census::tracked(rb, "timestamp readback")?;
     let mut ptr: *mut c_void = std::ptr::null_mut();
     rb.Map(0, None, Some(&mut ptr)).ok()?;
     if ptr.is_null() {
@@ -3167,7 +3167,7 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     };
     let mut buf: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).ok()?;
-    let buf = buf?;
+    let buf = crate::hle::d3d12x::resource_census::tracked(buf, "predication")?;
     let (raw, extra) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();

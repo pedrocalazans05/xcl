@@ -1591,7 +1591,7 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
         }
         return None;
     }
-    let b = b?;
+    let b = crate::hle::d3d12x::resource_census::tracked(b, "ExecuteIndirect argument order")?;
     *g = Some((dev.as_raw() as usize, b.clone()));
     Some(b)
 }

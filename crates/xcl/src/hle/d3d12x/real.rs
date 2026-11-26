@@ -172,6 +172,13 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
 static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+
+/// Bytes of the coherent windows imported into D3D12 (`OpenExistingHeapFromAddress`): those DXGI
+/// counts. 0 before, or when the import failed (the windows are then CPU memory only).
+pub fn uma_imported_bytes() -> u64 {
+    let Some(u) = crate::gpu::uma::get() else { return 0 };
+    UMA_HEAPS.lock().unwrap().iter().enumerate().filter(|(_, h)| h.is_some()).map(|(k, _)| u.window(k).1 as u64).sum()
+}
 /// console buffers placed in unified memory: resource → (address, bytes)
 /// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
 type UmaBuffer = (usize, usize, bool);

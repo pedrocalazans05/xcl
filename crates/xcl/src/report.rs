@@ -79,6 +79,10 @@ pub struct Report {
     /// `XCL_DSTORAGE_BCPACK_FILL`
     #[serde(default)]
     pub dstorage: crate::hle::dstorage::DStorageStats,
+    /// memory by owner against DXGI's budget, as the `XCL_ACTIVITY` line gives it: the last
+    /// snapshot of the run and the one of most video memory (#2688)
+    #[serde(default)]
+    pub memory_by_owner: crate::hle::d3d12x::memory_report::Table,
     pub notes: Vec<String>,
 }
 
@@ -146,6 +150,7 @@ pub fn build() -> Report {
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
         dstorage: crate::hle::dstorage::stats(),
+        memory_by_owner: crate::hle::d3d12x::memory_report::table(),
         notes: vec![
             "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
             "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),

@@ -454,7 +454,7 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
     let mut r: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
         .map_err(|x| format!("texture upload buffer: {x}"))?;
-    r.ok_or_else(|| "texture upload buffer".into())
+    crate::hle::d3d12x::resource_census::tracked(r, "upload staging").ok_or_else(|| "texture upload buffer".into())
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {

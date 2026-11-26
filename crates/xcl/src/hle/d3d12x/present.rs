@@ -1404,7 +1404,7 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
         &mut rb,
     )
     .ok()?;
-    let rb = rb?;
+    let rb = crate::hle::d3d12x::resource_census::tracked(rb, "frame dump readback")?;
     let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
     let s = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
     list.CopyTextureRegion(&dst, 0, 0, 0, &s, None);

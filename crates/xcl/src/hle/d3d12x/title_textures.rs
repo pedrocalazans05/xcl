@@ -531,6 +531,14 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// The title textures kept in step that are committed resources of their own (not on shared
+/// `vram::Pages` tiles): how many, and their console size in bytes (memory accounting, #2688;
+/// the PC resource can take somewhat more).
+pub fn committed_bytes() -> (usize, u64) {
+    let t = TEXTURES.lock().unwrap();
+    t.by_res.values().chain(t.shadowed.values()).filter(|e| !e.placed).fold((0, 0), |(n, b), e| (n + 1, b + e.tex.size()))
+}
+
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
 /// atlas (`<= 1M` pixels, up to `2048` on either axis, e.g. a retail title's `2048x128` R8 glyph cache).
 fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool {

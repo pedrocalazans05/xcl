@@ -196,7 +196,7 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     let mut resource = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() },
         D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut resource).ok()?;
-    resource
+    crate::hle::d3d12x::resource_census::tracked(resource, "dispatch chain scratch")
 }
 
 /// Called with the original six ABI views bound. The extended signature is
