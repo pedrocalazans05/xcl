@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(of(&asm(&[IMAGE_STORE])), None);
         let mut saved = asm(&[IMAGE_STORE, ("S_ENDPGM_SAVED", "ENC_SOPP", &[])]);
         saved.extend_from_slice(&[0xff; 8]);
-        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, instructions: 2 }));
+        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 2 }));
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
             END,
             ("S_CODE_END", "ENC_SOPP", &[]),
         ]);
-        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, instructions: 7 }));
+        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, bvh_intersect: false, instructions: 7 }));
 
         // resolved far jump whose target lands past the decoded slice still fails closed
         let far_oob = asm(&[
