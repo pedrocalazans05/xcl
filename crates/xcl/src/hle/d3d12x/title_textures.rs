@@ -343,9 +343,9 @@ impl Table {
 
     /// Permanently retire active and shadowed entries overlapping `[va, end)` (used when a
     /// GPU-owned render target / depth / UAV overwrites the address range). Returns
-    /// `(pending_delta, retired_count, placed_res_to_unmap)`.
-    fn retire_range(&mut self, va: usize, end: usize) -> (isize, usize, Vec<usize>) {
-        let (mut pending_delta, mut retired, mut to_unmap) = (0isize, 0usize, Vec::new());
+    /// `(pending_delta, retired_res, placed_res_to_unmap)`.
+    fn retire_range(&mut self, va: usize, end: usize) -> (isize, Vec<usize>, Vec<usize>) {
+        let (mut pending_delta, mut retired, mut to_unmap) = (0isize, Vec::new(), Vec::new());
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
@@ -356,7 +356,7 @@ impl Table {
                 if old.placed && !old.unmapped {
                     to_unmap.push(ores);
                 }
-                retired += 1;
+                retired.push(ores);
             }
         }
         for (sva, sres, _) in self.shadowed_overlaps(va, end) {
@@ -365,7 +365,7 @@ impl Table {
                 if old.placed && !old.unmapped {
                     to_unmap.push(sres);
                 }
-                retired += 1;
+                retired.push(sres);
             }
         }
         if self.shadowed.is_empty() {
@@ -709,29 +709,43 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         .into_iter()
         .filter(|&g| g != va && mirror_source(g) == va)
         .collect();
-    let (retired, to_unmap) = {
+    let (retired_ptrs, to_unmap) = {
         let mut t = TEXTURES.lock().unwrap();
-        let (mut delta, mut retired, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+        let (mut delta, mut retired_ptrs, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
         if src != va {
             let (d2, r2, u2) = t.retire_range(src, src.saturating_add(len));
             delta += d2;
-            retired += r2;
+            retired_ptrs.extend(r2);
             unmap_ptrs.extend(u2);
         }
         for g in gpu_aliases {
             let (d3, r3, u3) = t.retire_range(g, g.saturating_add(len));
             delta += d3;
-            retired += r3;
+            retired_ptrs.extend(r3);
             unmap_ptrs.extend(u3);
         }
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        (retired, clone_resources(&unmap_ptrs))
+        (retired_ptrs, clone_resources(&unmap_ptrs))
     };
+    if !retired_ptrs.is_empty() {
+        {
+            let mut last = LAST_CONTENT.lock().unwrap();
+            for &r in &retired_ptrs {
+                last.remove(&r);
+            }
+        }
+        {
+            let mut g = STREAM_RECHECK.lock().unwrap();
+            for &r in &retired_ptrs {
+                g.remove(&r);
+            }
+        }
+    }
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
-    if retired > 0 {
+    if !retired_ptrs.is_empty() {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
