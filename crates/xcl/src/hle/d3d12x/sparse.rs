@@ -1518,22 +1518,25 @@ impl State {
     }
 }
 
+fn watchable_tile_runs(mapped: &FxHashMap<usize, TileEntry>) -> Vec<(usize, usize)> {
+    let mut tiles: Vec<usize> = mapped.iter().filter(|(_, e)| e.holes != 0xFFFF).map(|(&t, _)| t).collect();
+    tiles.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for t in tiles {
+        match runs.last_mut() {
+            Some(last) if last.1 == t => last.1 = t + TILE,
+            _ => runs.push((t, t + TILE)),
+        }
+    }
+    runs
+}
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
-        tiles.sort_unstable();
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for t in tiles {
-            match runs.last_mut() {
-                Some(last) if last.1 == t => last.1 = t + TILE,
-                _ => runs.push((t, t + TILE)),
-            }
-        }
-        s.runs = Some(runs);
+        s.runs = Some(watchable_tile_runs(&s.mapped));
     }
     s.runs.clone().unwrap_or_default()
 }
@@ -2558,5 +2561,20 @@ mod tests {
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
         }
+    }
+    #[test]
+    fn watchable_tile_runs_omits_vram_only_holes_until_unmasked() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let t0 = 0x1000_0000usize;
+        let t1 = t0 + TILE;
+        let t2 = t1 + TILE;
+        mapped.insert(t0, TileEntry::with_holes((0, 0), 0));
+        mapped.insert(t1, TileEntry::with_holes((0, 1), 0xFFFF));
+        mapped.insert(t2, TileEntry::with_holes((0, 2), 0x00FF));
+
+        assert_eq!(watchable_tile_runs(&mapped), vec![(t0, t0 + TILE), (t2, t2 + TILE)]);
+
+        mapped.get_mut(&t1).unwrap().holes = 0;
+        assert_eq!(watchable_tile_runs(&mapped), vec![(t0, t2 + TILE)]);
     }
 }
