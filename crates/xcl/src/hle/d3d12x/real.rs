@@ -425,6 +425,11 @@ pub fn device_raw() -> *mut c_void {
 
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
 pub fn video_memory() -> Option<(u64, u64)> {
+    video_memory_info().map(|(local, non_local, _)| (local, non_local))
+}
+
+/// The process's video memory on the device's adapter: (local usage, non-local usage, local budget).
+pub fn video_memory_info() -> Option<(u64, u64, u64)> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -436,7 +441,7 @@ pub fn video_memory() -> Option<(u64, u64)> {
         let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+        Some((local.CurrentUsage, non_local.CurrentUsage, local.Budget))
     }
 }
 
