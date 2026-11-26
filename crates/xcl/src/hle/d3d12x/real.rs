@@ -4203,12 +4203,33 @@ impl Drop for SlotGuard {
     }
 }
 
+/// Compute DXIL compiles (`128 KiB..256 KiB`, e.g. per-instruction fallback CS) take tens of
+/// seconds and >1 GiB each in `amdxc64` when `xcl-pso*` workers compile them simultaneously;
+/// gate them into `MEDIUM_COMPILES` while keeping `huge_pso_bytes()` (default `256 KiB`) for
+/// graphics pipelines and title-thread deferral.
+const MEDIUM_COMPUTE_DRIVER_COMPILE: usize = 128 << 10;
+const LARGE_DRIVER_COMPILE: usize = 512 << 10;
+static MEDIUM_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
 static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
 
+fn driver_compile_gate_bytes(kind: &str, huge_bytes: usize) -> usize {
+    if kind == "compute" || kind == "compute retry" {
+        huge_bytes.min(MEDIUM_COMPUTE_DRIVER_COMPILE)
+    } else {
+        huge_bytes
+    }
+}
+
 fn compile_slots(bytes: usize) -> &'static Slots {
-    if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
+    if bytes >= GIANT_DRIVER_COMPILE {
+        &GIANT_COMPILES
+    } else if bytes >= LARGE_DRIVER_COMPILE {
+        &BIG_COMPILES
+    } else {
+        &MEDIUM_COMPILES
+    }
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
@@ -4229,13 +4250,15 @@ fn pso_trace() -> bool {
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
-    let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge_bytes = huge_pso_bytes();
+    let gate_bytes = driver_compile_gate_bytes(kind, huge_bytes);
+    let gated = gate && bytes >= gate_bytes && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = gated.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    let log = pso_trace() || bytes >= huge_pso_bytes();
+    let log = pso_trace() || bytes >= huge_bytes;
     if log {
         let record = record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
@@ -4246,7 +4269,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let r = build();
     let took = started.elapsed();
     if log {
-        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
+        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_bytes || gated, gated, waited));
     }
     (r, took)
 }
@@ -4447,12 +4470,16 @@ mod big_compile_tests {
         assert_eq!(*S.n.lock().unwrap(), 0);
     }
 
+    static GLOBAL_SLOTS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn small_and_title_thread_compiles_bypass_the_gate() {
+        let _lock = GLOBAL_SLOTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
         // thread, both go on at once
-        // (both lanes: a huge compile of any size would block on a gate it should bypass)
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
+        // (all three lanes: a huge compile of any size would block on a gate it should bypass)
+        let mut held: Vec<_> = (0..MEDIUM_COMPILES.most()).map(|_| big_compile_turn(&MEDIUM_COMPILES, || true, || false)).collect();
+        held.extend((0..BIG_COMPILES.most()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)));
         held.push(big_compile_turn(&GIANT_COMPILES, || true, || false));
         let small = std::thread::Builder::new()
             .name("xcl-pso-test".into())
@@ -4465,6 +4492,51 @@ mod big_compile_tests {
         assert_eq!(std::thread::spawn(|| driver_compile("test", usize::MAX / 2, true, || 8)).join().unwrap(), 8);
         assert!(t0.elapsed() < Duration::from_secs(2));
         drop(held);
+    }
+
+    #[test]
+    fn medium_compute_gate_threshold_applies_only_to_compute() {
+        assert_eq!(driver_compile_gate_bytes("compute", 256 << 10), MEDIUM_COMPUTE_DRIVER_COMPILE);
+        assert_eq!(driver_compile_gate_bytes("compute retry", 256 << 10), MEDIUM_COMPUTE_DRIVER_COMPILE);
+        assert_eq!(driver_compile_gate_bytes("compute", 64 << 10), 64 << 10);
+        assert_eq!(driver_compile_gate_bytes("graphics", 256 << 10), 256 << 10);
+        assert_eq!(driver_compile_gate_bytes("test", 256 << 10), 256 << 10);
+        assert!(std::ptr::eq(compile_slots(128 << 10), &MEDIUM_COMPILES));
+        assert!(std::ptr::eq(compile_slots(179 << 10), &MEDIUM_COMPILES));
+        assert!(std::ptr::eq(compile_slots(217 << 10), &MEDIUM_COMPILES));
+    }
+
+    #[test]
+    fn medium_compute_worker_compiles_are_gated_in_medium_lane() {
+        let _lock = GLOBAL_SLOTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let held: Vec<_> = (0..MEDIUM_COMPILES.most())
+            .map(|_| big_compile_turn(&MEDIUM_COMPILES, || true, || false))
+            .collect();
+
+        // < 128 KiB compute, cached (`gate = false`) 180 KiB compute, and title-thread 180 KiB
+        // compute all bypass `MEDIUM_COMPILES` immediately.
+        let small_cs = std::thread::Builder::new()
+            .name("xcl-pso-test".into())
+            .spawn(|| driver_compile("compute", MEDIUM_COMPUTE_DRIVER_COMPILE - 1, true, || 11))
+            .unwrap();
+        let cached_cs = std::thread::Builder::new()
+            .name("xcl-pso-test".into())
+            .spawn(|| driver_compile("compute", 180 << 10, false, || 12))
+            .unwrap();
+        let title_cs = std::thread::spawn(|| driver_compile("compute", 180 << 10, true, || 13));
+        assert_eq!(small_cs.join().unwrap(), 11);
+        assert_eq!(cached_cs.join().unwrap(), 12);
+        assert_eq!(title_cs.join().unwrap(), 13);
+
+        // A cold 180 KiB compute compile on an `xcl-pso*` worker waits until a `MEDIUM_COMPILES` slot frees.
+        let gated_cs = std::thread::Builder::new()
+            .name("xcl-pso-test".into())
+            .spawn(|| driver_compile("compute", 180 << 10, true, || 14))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!gated_cs.is_finished(), "cold 180 KiB compute worker compile must wait on MEDIUM_COMPILES");
+        drop(held);
+        assert_eq!(gated_cs.join().unwrap(), 14);
     }
 
     #[test]
@@ -6344,7 +6416,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let gcached = gram.or_else(|| gdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new));
 
     let bytes = mesh_bytes + tp.cs.len();
-    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge_bytes = huge_pso_bytes();
+    let gate = (bytes >= huge_bytes || tp.cs.len() >= driver_compile_gate_bytes("compute", huge_bytes))
+        && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let mut slot = None;
     let mut take_cold_slot = || {
         if gate && slot.is_none() {
