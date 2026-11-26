@@ -543,6 +543,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     // (a new texture object, or the address of an old one again: its first upload is not left out)
     LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     STREAM_RECHECK.lock().unwrap().remove(&(res as usize));
+    clear_incomplete(res as usize);
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -606,6 +607,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
+        clear_incomplete(r.as_raw() as usize);
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
@@ -671,7 +673,7 @@ pub fn note_gpu_write(res: usize) {
         let p = res as *mut c_void;
         unsafe {
             if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
-                super::vram::map_levels(r, None);
+                let _ = super::vram::map_levels(r, None);
             }
         }
     }
@@ -684,6 +686,7 @@ pub fn note_gpu_write(res: usize) {
             false
         }
     };
+    clear_incomplete(res);
     if marked {
         STREAM_RECHECK.lock().unwrap().remove(&res);
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
@@ -743,6 +746,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         }
     }
     for r in &to_unmap {
+        clear_incomplete(r.as_raw() as usize);
         super::vram::unmap_superseded(r);
     }
     if !retired_ptrs.is_empty() {
@@ -754,6 +758,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 pub fn forget(res: usize) {
     LAST_CONTENT.lock().unwrap().remove(&res);
     STREAM_RECHECK.lock().unwrap().remove(&res);
+    clear_incomplete(res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -762,11 +767,14 @@ pub fn forget(res: usize) {
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
+        let r_key = r.as_raw() as usize;
+        LAST_CONTENT.lock().unwrap().remove(&r_key);
         unsafe {
             super::vram::remap_if_unmapped(r);
             // (lazy levels: one the GPU wrote is not uploaded again, so all of it has pages)
-            if super::vram::level_pages() && TEXTURES.lock().unwrap().by_res.get(&(r.as_raw() as usize)).is_some_and(|e| e.gpu_written) {
-                super::vram::map_levels(r, None);
+            let is_gpu = TEXTURES.lock().unwrap().by_res.get(&r_key).is_some_and(|e| e.gpu_written);
+            if super::vram::level_pages() && is_gpu {
+                let _ = super::vram::map_levels(r, None);
             }
         }
     }
@@ -1011,29 +1019,113 @@ unsafe fn refresh_once(queue: *mut c_void) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    let retry = if INCOMPLETE_LEN.load(Ordering::Acquire) > 0 {
+        incomplete_to_retry()
+    } else {
+        std::collections::HashSet::new()
+    };
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && retry.is_empty() {
         return;
     }
-    // textures made since the last submit and those with a written page; a reference each
-    // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+    // textures made since the last submit, incomplete textures whose pool gained capacity, and
+    // those with a written page; a reference each while they are uploaded
+    let (todo, stale_retry): (Vec<(ID3D12Resource, Upload)>, Vec<usize>) = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        let (matched, cleared_pending) = t.take_dirty_and_pending(&dirty, page as usize);
+        let stale: Vec<usize> = retry.iter()
+            .copied()
+            .filter(|k| t.by_res.get(k).is_none_or(|e| e.gpu_written))
+            .collect();
+        let (mut matched, cleared_pending) = t.take_dirty_and_pending(&dirty, page as usize);
         if cleared_pending > 0 {
             PENDING.fetch_sub(cleared_pending, Ordering::Relaxed);
         }
-        matched
+        if !retry.is_empty() {
+            let mut added = false;
+            for &res in &retry {
+                if t.by_res.get(&res).is_some_and(|e| !e.gpu_written) {
+                    matched.push(res);
+                    added = true;
+                }
+            }
+            if added {
+                matched.sort_unstable();
+                matched.dedup();
+            }
+        }
+        let items = matched
             .into_iter()
             .filter_map(|res| {
                 let e = t.by_res.get(&res)?;
                 let p = res as *mut c_void;
                 ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
-            .collect()
+            .collect();
+        (items, stale)
     });
+    for k in stale_retry {
+        clear_incomplete(k);
+    }
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     upload_all(todo);
+}
+
+/// Placed textures that could not map all required tiles/levels at cap, with `(device, state)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Incomplete {
+    Eager { min_tiles: usize },
+    Lazy { levels: Vec<u32>, min_tiles: usize },
+}
+
+impl Incomplete {
+    fn min_tiles(&self) -> usize {
+        match self {
+            Self::Eager { min_tiles } | Self::Lazy { min_tiles, .. } => *min_tiles,
+        }
+    }
+}
+
+static INCOMPLETE: Mutex<BTreeMap<usize, (usize, Incomplete)>> = Mutex::new(BTreeMap::new());
+static INCOMPLETE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn set_incomplete(res: usize, dev: usize, inc: Incomplete) {
+    {
+        let mut g = INCOMPLETE.lock().unwrap();
+        g.insert(res, (dev, inc));
+        INCOMPLETE_LEN.store(g.len(), Ordering::Release);
+    }
+    // Re-check after publishing so concurrent `note_gpu_write`, shadowing, `retire_overlapping`,
+    // or `forget` cannot leave a non-active entry behind in `INCOMPLETE`.
+    let active = TEXTURES.lock().unwrap().by_res.get(&res).is_some_and(|e| !e.gpu_written);
+    if !active {
+        clear_incomplete(res);
+    }
+}
+
+fn clear_incomplete(res: usize) {
+    if INCOMPLETE_LEN.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = INCOMPLETE.lock().unwrap();
+    if g.remove(&res).is_some() {
+        INCOMPLETE_LEN.store(g.len(), Ordering::Release);
+    }
+}
+
+unsafe fn incomplete_to_retry() -> std::collections::HashSet<usize> {
+    let entries: Vec<(usize, usize, usize)> = INCOMPLETE.lock().unwrap()
+        .iter()
+        .map(|(&res, (dev, inc))| (res, *dev, inc.min_tiles()))
+        .collect();
+    let mut avail_by_dev: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut out = std::collections::HashSet::new();
+    for (res, dev, need) in entries {
+        let avail = *avail_by_dev.entry(dev).or_insert_with(|| super::vram::available_tiles(dev));
+        if avail >= need {
+            out.insert(res);
+        }
+    }
+    out
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -1362,13 +1454,42 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let res_key = r.as_raw() as usize;
+            let (_, eager_gained, eager_need) = super::vram::backfill_incomplete_state(&r);
+            if let Some(min_tiles) = eager_need {
+                set_incomplete(res_key, dev, Incomplete::Eager { min_tiles });
+            } else if eager_gained {
+                clear_incomplete(res_key);
+            }
+            let mut lazy_gained = false;
+            let pending_lazy = INCOMPLETE.lock().unwrap().get(&res_key).and_then(|(_, inc)| {
+                match inc {
+                    Incomplete::Lazy { levels, .. } => Some(levels.clone()),
+                    Incomplete::Eager { .. } => None,
+                }
+            });
+            if let Some(levels) = pending_lazy {
+                let m = super::vram::map_levels(&r, Some(&levels));
+                lazy_gained = m.gained;
+                if m.unmapped.is_empty() {
+                    clear_incomplete(res_key);
+                } else {
+                    set_incomplete(
+                        res_key, dev,
+                        Incomplete::Lazy { levels: m.unmapped, min_tiles: m.min_tiles },
+                    );
+                }
+            }
+            if eager_gained || lazy_gained {
+                LAST_CONTENT.lock().unwrap().remove(&res_key);
+            }
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
                 let h = content_hash(&title_bytes(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
+                if same_as_last_upload(res_key, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
                         crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
@@ -1391,15 +1512,26 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             if super::vram::level_pages() {
                 // (the queue waits for these mappings before the copies: `vram::before_execute` below)
-                map_levels_with_texels(&r, &subs);
+                map_levels_with_texels(device, &r, &subs);
             }
             batch.push((r, subs, states));
         }
+        let clear_batch_hashes =
+            |items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]| {
+                let mut lc = LAST_CONTENT.lock().unwrap();
+                for (r, _, _) in items {
+                    lc.remove(&(r.as_raw() as usize));
+                }
+            };
         let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else {
+            clear_batch_hashes(&batch);
+            continue;
+        };
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
+                clear_batch_hashes(&batch);
                 warn(&e);
                 continue;
             }
@@ -1409,12 +1541,23 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
+                if !failed.is_empty() {
+                    let mut lc = LAST_CONTENT.lock().unwrap();
+                    for &(idx, _) in &failed {
+                        if let Some((r, _, _)) = batch.get(idx) {
+                            lc.remove(&(r.as_raw() as usize));
+                        }
+                    }
+                }
                 for (_, e) in failed {
                     warn(&e);
                 }
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                clear_batch_hashes(&batch);
+                warn(&e);
+            }
         }
     }
 }
@@ -1425,13 +1568,21 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
 /// texture's larger levels before the title has memory behind them (read as zeros,
 /// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
 /// to tiles that are not mapped, which drops it (tiled resources tier 2).
-unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
-    if !super::vram::has_lazy_levels(r.as_raw() as usize) {
+unsafe fn map_levels_with_texels(dev: usize, r: &ID3D12Resource, subs: &[Subresource]) {
+    let res_key = r.as_raw() as usize;
+    if !super::vram::has_lazy_levels(res_key) {
         return;
     }
     // (one slice: its subresources are its levels)
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
-    super::vram::map_levels(r, Some(&present));
+    let m = super::vram::map_levels(r, Some(&present));
+    if m.unmapped.is_empty() {
+        clear_incomplete(res_key);
+    } else {
+        set_incomplete(
+            res_key, dev, Incomplete::Lazy { levels: m.unmapped, min_tiles: m.min_tiles },
+        );
+    }
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -3161,5 +3312,283 @@ mod tests {
 
         assert!(t.mark_gpu_written(0x100));
         assert!(t.watchable_ranges().is_empty());
+    }
+
+    unsafe fn read_subresource_bytes(
+        dev: &ID3D12Device, queue: &ID3D12CommandQueue, r: &ID3D12Resource, sub: u32,
+    ) -> Vec<u8> {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let rd = r.GetDesc();
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+        dev.GetCopyableFootprints(
+            &rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total),
+        );
+        let mut rb: Option<ID3D12Resource> = None;
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1,
+            DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+        };
+        let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        dev.CreateCommittedResource(
+            &props, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb,
+        ).unwrap();
+        let rb = rb.unwrap();
+        let alloc: ID3D12CommandAllocator =
+            dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList =
+            dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&rb),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(r),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+        };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().unwrap();
+        own_work(|| {
+            super::super::vram::before_execute(queue);
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            texture::wait(dev, queue).unwrap();
+        });
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).unwrap();
+        let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+        for y in 0..rows as usize {
+            let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize;
+            let row = std::slice::from_raw_parts((p as *const u8).add(off), row_bytes as usize);
+            out.extend_from_slice(row);
+        }
+        rb.Unmap(0, None);
+        out
+    }
+
+    struct CapReservation(usize);
+    impl Drop for CapReservation {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::MEM_RELEASE;
+            unsafe { crate::hle::kernelx::VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE); }
+        }
+    }
+
+    struct PlacedReg(ID3D12Resource);
+    impl Drop for PlacedReg {
+        fn drop(&mut self) { forget(self.0.as_raw() as usize); }
+    }
+
+    unsafe fn probe_tiling(dev: &ID3D12Device, w: u64, h: u32, mips: u16) -> Option<(u32, u32)> {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w, Height: h,
+            DepthOrArraySize: 1, MipLevels: mips, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..Default::default()
+        };
+        let mut probe: Option<ID3D12Resource> = None;
+        dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut probe).ok()?;
+        let probe = probe?;
+        let (mut all, mut n, mut mip0) = (0u32, 1u32, D3D12_SUBRESOURCE_TILING::default());
+        dev.GetResourceTiling(&probe, Some(&mut all), None, None, Some(&mut n), 0, &mut mip0);
+        let top = if n == 1 {
+            mip0.WidthInTiles * mip0.HeightInTiles as u32 * mip0.DepthInTiles as u32
+        } else {
+            0
+        };
+        Some((all, top))
+    }
+
+    unsafe fn place_registered(raw_dev: *mut c_void, va: usize, d: &[u8; 0x38]) -> PlacedReg {
+        let riid = &ID3D12Resource::IID as *const windows::core::GUID
+            as *const windows_sys::core::GUID;
+        let mut p = std::ptr::null_mut();
+        let st = D3D12_RESOURCE_STATE_COMMON.0 as u32;
+        let hr = super::super::device_x::create_placed_resource_x(
+            raw_dev, va as u64, d.as_ptr(), st, std::ptr::null(), riid, &mut p,
+        );
+        assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+        PlacedReg(ID3D12Resource::from_raw(p))
+    }
+
+    unsafe fn commit_watched(base: usize, offset: usize, size: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE};
+        let at = base + offset;
+        let span = size.next_multiple_of(0x1_0000);
+        let got = crate::hle::kernelx::VirtualAlloc(
+            at as *const c_void, span, MEM_COMMIT, PAGE_READWRITE,
+        ) as usize;
+        assert_eq!(got, at);
+        at
+    }
+
+    #[test]
+    fn capped_eager_placed_texture_recovers_on_upload_after_capacity_frees() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+
+        let _vg = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if super::super::backend() != super::super::Backend::Real {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        }
+        unsafe {
+            let raw_dev = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_dev).unwrap();
+            let Some((all, _)) = probe_tiling(dev, 256, 256, 1).filter(|&(a, _)| a >= 2) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let half = all / 2;
+            let Some(mut cap) = super::super::vram::CappedPagesTestGuard::install(dev, half) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue =
+                dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let base = kernelx::VirtualAlloc(
+                std::ptr::null(), 24usize << 30, 0x2040_2000, PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(base, 0);
+            let _resv = CapReservation(base);
+            let d = console_desc(3, 256, 256, 1, 1, 28, 0x109);
+            let tex_meta = xg::Texture::new(&d).unwrap();
+            let surf = tex_meta.texels().unwrap();
+            let size = tex_meta.size() as usize;
+            let build_bytes = |seed: usize| -> (Vec<u8>, Vec<u8>) {
+                let mut buf = vec![0u8; size];
+                let l = &surf.chain.levels[0];
+                let pat: Vec<u8> = (0..l.width * l.height * surf.bpe as usize)
+                    .map(|k| 1 + ((seed + k * 17) % 251) as u8)
+                    .collect();
+                surf.chain.tile_level(&mut buf[..surf.chain.slice_bytes], 0, 0, &pat);
+                let want = subresources(buf.as_ptr() as usize, &tex_meta).remove(0).data;
+                (buf, want)
+            };
+
+            // 1. Active partially backed texture (`half / all` tiles) at disjoint address recovers
+            // on normal `refresh` after capacity frees, with no direct `remap_if_unmapped` call.
+            let at_a = commit_watched(base, 0x2_0000, size);
+            let (bytes_a, want_a) = build_bytes(3);
+            std::ptr::copy_nonoverlapping(bytes_a.as_ptr(), at_a as *mut u8, size);
+            let tex_a = place_registered(raw_dev, at_a, &d);
+            refresh(queue.as_raw());
+            let partial_a = read_subresource_bytes(dev, &queue, &tex_a.0, 0);
+            assert_ne!(partial_a, want_a, "capped upload must leave unbacked tiles zero");
+            assert!(partial_a.iter().any(|&b| b != 0), "backed half must hold uploaded texels");
+            cap.free_tiles((all - half) as usize);
+            refresh(queue.as_raw());
+            assert_eq!(read_subresource_bytes(dev, &queue, &tex_a.0, 0), want_a);
+
+            // 2. Active 0-tile texture (`0 / all` tiles) recovers on a same-byte dirty submit once
+            // capacity frees, and subsequent unchanged submits skip again.
+            let at_b = commit_watched(base, 0x20_0000, size);
+            let (bytes_b, want_b) = build_bytes(11);
+            std::ptr::copy_nonoverlapping(bytes_b.as_ptr(), at_b as *mut u8, size);
+            let tex_b = place_registered(raw_dev, at_b, &d);
+            refresh(queue.as_raw());
+            assert!(read_subresource_bytes(dev, &queue, &tex_b.0, 0).iter().all(|&b| b == 0));
+            cap.free_tiles(all as usize);
+            std::ptr::copy_nonoverlapping(bytes_b.as_ptr(), at_b as *mut u8, size);
+            refresh(queue.as_raw());
+            assert_eq!(read_subresource_bytes(dev, &queue, &tex_b.0, 0), want_b);
+            let unch0 = UNCHANGED.load(Ordering::Relaxed);
+            std::ptr::copy_nonoverlapping(bytes_b.as_ptr(), at_b as *mut u8, size);
+            refresh(queue.as_raw());
+            assert_eq!(UNCHANGED.load(Ordering::Relaxed), unch0 + 1);
+            drop((tex_a, tex_b));
+        }
+    }
+
+    #[test]
+    fn capped_lazy_level_texture_retries_same_bytes_after_capacity_frees() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+
+        let _vg = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if super::super::backend() != super::super::Backend::Real {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        }
+        struct LevelPagesReset;
+        impl Drop for LevelPagesReset {
+            fn drop(&mut self) {
+                super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            }
+        }
+        unsafe {
+            let raw_dev = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_dev).unwrap();
+            let Some((all, top_tiles)) = probe_tiling(dev, 1024, 1024, 11)
+                .filter(|&(a, t)| t > 0 && t < a)
+            else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(mut cap) =
+                super::super::vram::CappedPagesTestGuard::install(dev, all - top_tiles)
+            else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue =
+                dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let base = kernelx::VirtualAlloc(
+                std::ptr::null(), 24usize << 30, 0x2040_2000, PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(base, 0);
+            let _resv = CapReservation(base);
+            let d = console_desc(3, 1024, 1024, 1, 11, 28, 0x109);
+            let tex_meta = xg::Texture::new(&d).unwrap();
+            let surf = tex_meta.texels().unwrap();
+            let size = tex_meta.size() as usize;
+            let mut whole = vec![0u8; size];
+            for (m, l) in surf.chain.levels.iter().enumerate() {
+                let pat: Vec<u8> = (0..l.width * l.height * surf.bpe as usize)
+                    .map(|k| 1 + ((m * 7 + k * 13) % 251) as u8)
+                    .collect();
+                surf.chain.tile_level(&mut whole[..surf.chain.slice_bytes], m, 0, &pat);
+            }
+            let want = subresources(whole.as_ptr() as usize, &tex_meta);
+            let at = commit_watched(base, 0x2_0000, size);
+            std::ptr::copy_nonoverlapping(whole.as_ptr(), at as *mut u8, size);
+
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            let _lp_guard = LevelPagesReset;
+            let tex = place_registered(raw_dev, at, &d);
+            if !super::super::vram::has_lazy_levels(tex.0.as_raw() as usize) {
+                return;
+            }
+
+            // First upload at cap: lower levels `1..11` map & populate; mip `0` is skipped at cap.
+            refresh(queue.as_raw());
+            for sub in 1..11u32 {
+                let got = read_subresource_bytes(dev, &queue, &tex.0, sub);
+                assert_eq!(got, want[sub as usize].data);
+            }
+            assert!(read_subresource_bytes(dev, &queue, &tex.0, 0).iter().all(|&b| b == 0));
+
+            // Still capped + identical bytes: skipped without redundant re-upload.
+            let unch0 = UNCHANGED.load(Ordering::Relaxed);
+            std::ptr::copy_nonoverlapping(whole.as_ptr(), at as *mut u8, size);
+            refresh(queue.as_raw());
+            assert_eq!(UNCHANGED.load(Ordering::Relaxed), unch0 + 1);
+            assert!(read_subresource_bytes(dev, &queue, &tex.0, 0).iter().all(|&b| b == 0));
+
+            // Capacity returns + identical bytes rewritten: mip `0` maps and uploads instead of
+            // being swallowed by `same_as_last_upload`, then subsequent identical submits skip.
+            cap.free_tiles(top_tiles as usize);
+            std::ptr::copy_nonoverlapping(whole.as_ptr(), at as *mut u8, size);
+            refresh(queue.as_raw());
+            for sub in 0..11u32 {
+                let got = read_subresource_bytes(dev, &queue, &tex.0, sub);
+                assert_eq!(got, want[sub as usize].data);
+            }
+            let unch1 = UNCHANGED.load(Ordering::Relaxed);
+            std::ptr::copy_nonoverlapping(whole.as_ptr(), at as *mut u8, size);
+            refresh(queue.as_raw());
+            assert_eq!(UNCHANGED.load(Ordering::Relaxed), unch1 + 1);
+            drop(tex);
+        }
     }
 }
