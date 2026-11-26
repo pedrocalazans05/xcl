@@ -66,6 +66,9 @@ pub struct Layout {
     /// XORed into every in-block byte offset: the pipe / bank swizzle a T# base address carries
     /// in its low bits (`base & (block_bytes - 1)`), 0 otherwise
     pub base_xor: usize,
+    /// largest power-of-two horizontal element run inside a block whose byte offsets advance
+    /// contiguously by `+e` with zero interference from `oy`/`oz`/`hx`/`hy`/`hz`
+    run_elems: usize,
     ox: &'static [u32],
     oy: &'static [u32],
     oz: &'static [u32],
@@ -108,7 +111,7 @@ impl Layout {
             if mode == 0 {
                 let bw = 256 >> elem_log2;
                 let ox: &'static [u32] = (0..bw as u32).map(|x| x << elem_log2).collect::<Vec<_>>().leak();
-                return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: &[0], oz: &[0], hx: &[0], hy: &[0], hz: &[0] });
+                return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, run_elems: bw, ox, oy: &[0], oz: &[0], hx: &[0], hy: &[0], hz: &[0] });
             }
             let blk = block_log2(mode)?;
             let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
@@ -161,6 +164,29 @@ impl Layout {
             let used = bits[..blk as usize].iter().fold(0u32, |m, &b| m | ((b >> shift) & 0xFFFF) as u32) >> l.min(16);
             table(1 << (32 - used.leading_zeros()), shift, l)
         };
+        let ox = table(bw, 0, 0);
+        let oy = table(bh, 16, 0);
+        let oz = table(bd, 32, 0);
+        let hx = high(wl, 0);
+        let hy = high(hl, 16);
+        let hz = high(dl, 32);
+        let other_bits = oy.iter().chain(oz).chain(hx).chain(hy).chain(hz).fold(0u32, |a, &b| a | b);
+        let mut run_elems = 1usize;
+        while run_elems * 2 <= bw {
+            let next = run_elems * 2;
+            let mask = ((next << elem_log2) - 1) as u32;
+            if (other_bits & mask) != 0 {
+                break;
+            }
+            let ok = (0..bw).all(|x| {
+                let base = ox[x & !(next - 1)];
+                (base & mask) == 0 && ox[x] == base + (((x & (next - 1)) << elem_log2) as u32)
+            });
+            if !ok {
+                break;
+            }
+            run_elems = next;
+        }
         Layout {
             mode,
             elem_log2,
@@ -169,12 +195,13 @@ impl Layout {
             block_d: bd,
             block_bytes: 1 << blk,
             base_xor: 0,
-            ox: table(bw, 0, 0),
-            oy: table(bh, 16, 0),
-            oz: table(bd, 32, 0),
-            hx: high(wl, 0),
-            hy: high(hl, 16),
-            hz: high(dl, 32),
+            run_elems,
+            ox,
+            oy,
+            oz,
+            hx,
+            hy,
+            hz,
         }
     }
 
@@ -204,34 +231,215 @@ impl Layout {
         block * self.block_bytes + (xor as usize ^ self.base_xor)
     }
 
+    /// Effective horizontal contiguous run width in elements, respecting any `base_xor` low bits.
+    #[inline]
+    fn effective_run(&self) -> usize {
+        if self.base_xor == 0 {
+            self.run_elems
+        } else {
+            let lim = (1usize << self.base_xor.trailing_zeros()) >> self.elem_log2;
+            self.run_elems.min(lim).max(1)
+        }
+    }
+
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
     pub fn detile(&self, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         let e = 1usize << self.elem_log2;
         let mut out = vec![0u8; w * h * e];
-        for y in 0..h {
-            for x in 0..w {
-                let o = self.offset(x, y, w);
-                if let Some(s) = src.get(o..o + e) {
-                    let d = (y * w + x) * e;
-                    out[d..d + e].copy_from_slice(s);
-                }
-            }
-        }
+        self.detile_2d(src, &mut out, 0, w, h, w, (0, 0), 0);
         out
     }
 
     /// linear rows → tiled (the inverse of `detile`)
     pub fn tile(&self, linear: &[u8], w: usize, h: usize) -> Vec<u8> {
-        let e = 1usize << self.elem_log2;
         let mut out = vec![0u8; self.size(w, h)];
-        for y in 0..h {
-            for x in 0..w {
-                let o = self.offset(x, y, w);
-                let s = (y * w + x) * e;
-                out[o..o + e].copy_from_slice(&linear[s..s + e]);
+        self.tile_2d(&mut out, linear, 0, w, h, w, (0, 0), 0);
+        out
+    }
+
+    /// Block-slab 2D detile with contiguous horizontal run copies (`src` tiled -> `out` linear).
+    /// Iterating one tiled block `(by, bx)` at a time keeps each 4 KiB / 64 KiB block hot in L1
+    /// cache and eliminates per-element block arithmetic and bounds checks on complete blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn detile_2d(&self, src: &[u8], out: &mut [u8], base_off: usize, w: usize, h: usize, pitch: usize, origin: (usize, usize), slice: usize) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let e = 1usize << self.elem_log2;
+        if self.mode == 0 && self.base_xor == 0 && origin == (0, 0) {
+            let row = w * e;
+            let pitch_blocks = pitch.div_ceil(self.block_w);
+            for y in 0..h {
+                let o = base_off + (y / self.block_h) * pitch_blocks * self.block_bytes + self.oy[y % self.block_h] as usize;
+                let n = src.len().saturating_sub(o).min(row) / e * e;
+                if n > 0 {
+                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
+                }
+            }
+            return;
+        }
+        let pitch_blocks = pitch.div_ceil(self.block_w);
+        let z = self.oz[slice % self.block_d] ^ self.hz[(slice / self.block_d) % self.hz.len()];
+        let run = self.effective_run();
+        let run_bytes = run * e;
+        let row_bytes = w * e;
+        let (ox0, oy0) = origin;
+        let bx_start = ox0 / self.block_w;
+        let bx_end = (ox0 + w - 1) / self.block_w;
+        let by_start = oy0 / self.block_h;
+        let by_end = (oy0 + h - 1) / self.block_h;
+
+        for by in by_start..=by_end {
+            let y_lo = (by * self.block_h).max(oy0) - oy0;
+            let y_hi = ((by + 1) * self.block_h).min(oy0 + h) - oy0;
+            let hy = self.hy[by % self.hy.len()] ^ z;
+            let row_blocks = by * pitch_blocks;
+            for bx in bx_start..=bx_end {
+                let x_lo = (bx * self.block_w).max(ox0) - ox0;
+                let x_hi = ((bx + 1) * self.block_w).min(ox0 + w) - ox0;
+                let block_base = base_off + (row_blocks + bx) * self.block_bytes;
+                let b_xor = self.hx[bx % self.hx.len()] ^ hy ^ self.base_xor as u32;
+                let xi_lo = x_lo + ox0 - bx * self.block_w;
+                let xi_hi = x_hi + ox0 - bx * self.block_w;
+                if block_base.checked_add(self.block_bytes).is_some_and(|end| end <= src.len()) {
+                    let blk = &src[block_base..block_base + self.block_bytes];
+                    if run > 1 {
+                        let aligned_lo = (xi_lo + run - 1) & !(run - 1);
+                        let aligned_hi = xi_hi & !(run - 1);
+                        for y in y_lo..y_hi {
+                            let y_xor = self.oy[y + oy0 - by * self.block_h] ^ b_xor;
+                            let dst_row = &mut out[y * row_bytes..(y + 1) * row_bytes];
+                            let mut xi = xi_lo;
+                            let mut x = x_lo;
+                            let pre = aligned_lo.min(xi_hi);
+                            while xi < pre {
+                                let o = (self.ox[xi] ^ y_xor) as usize;
+                                dst_row[x * e..x * e + e].copy_from_slice(&blk[o..o + e]);
+                                xi += 1;
+                                x += 1;
+                            }
+                            while xi < aligned_hi {
+                                let o = (self.ox[xi] ^ y_xor) as usize;
+                                dst_row[x * e..x * e + run_bytes].copy_from_slice(&blk[o..o + run_bytes]);
+                                xi += run;
+                                x += run;
+                            }
+                            while xi < xi_hi {
+                                let o = (self.ox[xi] ^ y_xor) as usize;
+                                dst_row[x * e..x * e + e].copy_from_slice(&blk[o..o + e]);
+                                xi += 1;
+                                x += 1;
+                            }
+                        }
+                    } else {
+                        for y in y_lo..y_hi {
+                            let y_xor = self.oy[y + oy0 - by * self.block_h] ^ b_xor;
+                            let dst_row = &mut out[y * row_bytes..(y + 1) * row_bytes];
+                            for (dx, &x_off) in self.ox[xi_lo..xi_hi].iter().enumerate() {
+                                let o = (x_off ^ y_xor) as usize;
+                                let d = (x_lo + dx) * e;
+                                dst_row[d..d + e].copy_from_slice(&blk[o..o + e]);
+                            }
+                        }
+                    }
+                } else {
+                    for y in y_lo..y_hi {
+                        let y_xor = self.oy[y + oy0 - by * self.block_h] ^ b_xor;
+                        let dst_row = &mut out[y * row_bytes..(y + 1) * row_bytes];
+                        for (dx, &x_off) in self.ox[xi_lo..xi_hi].iter().enumerate() {
+                            let o = block_base + (x_off ^ y_xor) as usize;
+                            if let Some(s) = src.get(o..o + e) {
+                                let d = (x_lo + dx) * e;
+                                dst_row[d..d + e].copy_from_slice(s);
+                            }
+                        }
+                    }
+                }
             }
         }
-        out
+    }
+
+    /// Block-slab 2D tile with contiguous horizontal run copies (`linear` -> `dst` tiled).
+    #[allow(clippy::too_many_arguments)]
+    fn tile_2d(&self, dst: &mut [u8], linear: &[u8], base_off: usize, w: usize, h: usize, pitch: usize, origin: (usize, usize), slice: usize) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let e = 1usize << self.elem_log2;
+        if self.mode == 0 && self.base_xor == 0 && origin == (0, 0) {
+            let row = w * e;
+            let pitch_blocks = pitch.div_ceil(self.block_w);
+            for y in 0..h {
+                let o = base_off + (y / self.block_h) * pitch_blocks * self.block_bytes + self.oy[y % self.block_h] as usize;
+                dst[o..o + row].copy_from_slice(&linear[y * row..][..row]);
+            }
+            return;
+        }
+        let pitch_blocks = pitch.div_ceil(self.block_w);
+        let z = self.oz[slice % self.block_d] ^ self.hz[(slice / self.block_d) % self.hz.len()];
+        let run = self.effective_run();
+        let run_bytes = run * e;
+        let row_bytes = w * e;
+        let (ox0, oy0) = origin;
+        let bx_start = ox0 / self.block_w;
+        let bx_end = (ox0 + w - 1) / self.block_w;
+        let by_start = oy0 / self.block_h;
+        let by_end = (oy0 + h - 1) / self.block_h;
+
+        for by in by_start..=by_end {
+            let y_lo = (by * self.block_h).max(oy0) - oy0;
+            let y_hi = ((by + 1) * self.block_h).min(oy0 + h) - oy0;
+            let hy = self.hy[by % self.hy.len()] ^ z;
+            let row_blocks = by * pitch_blocks;
+            for bx in bx_start..=bx_end {
+                let x_lo = (bx * self.block_w).max(ox0) - ox0;
+                let x_hi = ((bx + 1) * self.block_w).min(ox0 + w) - ox0;
+                let block_base = base_off + (row_blocks + bx) * self.block_bytes;
+                let b_xor = self.hx[bx % self.hx.len()] ^ hy ^ self.base_xor as u32;
+                let xi_lo = x_lo + ox0 - bx * self.block_w;
+                let xi_hi = x_hi + ox0 - bx * self.block_w;
+                let blk = &mut dst[block_base..block_base + self.block_bytes];
+                if run > 1 {
+                    let aligned_lo = (xi_lo + run - 1) & !(run - 1);
+                    let aligned_hi = xi_hi & !(run - 1);
+                    for y in y_lo..y_hi {
+                        let y_xor = self.oy[y + oy0 - by * self.block_h] ^ b_xor;
+                        let src_row = &linear[y * row_bytes..(y + 1) * row_bytes];
+                        let mut xi = xi_lo;
+                        let mut x = x_lo;
+                        let pre = aligned_lo.min(xi_hi);
+                        while xi < pre {
+                            let o = (self.ox[xi] ^ y_xor) as usize;
+                            blk[o..o + e].copy_from_slice(&src_row[x * e..x * e + e]);
+                            xi += 1;
+                            x += 1;
+                        }
+                        while xi < aligned_hi {
+                            let o = (self.ox[xi] ^ y_xor) as usize;
+                            blk[o..o + run_bytes].copy_from_slice(&src_row[x * e..x * e + run_bytes]);
+                            xi += run;
+                            x += run;
+                        }
+                        while xi < xi_hi {
+                            let o = (self.ox[xi] ^ y_xor) as usize;
+                            blk[o..o + e].copy_from_slice(&src_row[x * e..x * e + e]);
+                            xi += 1;
+                            x += 1;
+                        }
+                    }
+                } else {
+                    for y in y_lo..y_hi {
+                        let y_xor = self.oy[y + oy0 - by * self.block_h] ^ b_xor;
+                        let src_row = &linear[y * row_bytes..(y + 1) * row_bytes];
+                        for (dx, &x_off) in self.ox[xi_lo..xi_hi].iter().enumerate() {
+                            let o = (x_off ^ y_xor) as usize;
+                            let s = (x_lo + dx) * e;
+                            blk[o..o + e].copy_from_slice(&src_row[s..s + e]);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -378,6 +586,7 @@ impl Chain {
 
     /// element (x, y) of level `l` in array slice `slice` (from the slice's start): the slice
     /// is z of the 2D patterns – the XOR modes take pipe bits from it
+    #[cfg(test)]
     fn element_at(&self, l: &MipLevel, x: usize, y: usize, slice: usize) -> usize {
         l.offset + self.layout.offset_z(x + l.origin.0, y + l.origin.1, slice, l.pitch)
     }
@@ -425,59 +634,37 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let t = &self.layout;
-        let e = 1usize << t.elem_log2;
+        let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
-        if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
-            // linear: a row's elements are contiguous, so it is copied whole (the elements that
-            // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
-            let row = l.width * e;
+        if self.layout.block_d != 1 {
             for y in 0..l.height {
-                let o = self.element_at(&l, 0, y, slice);
-                let n = src.len().saturating_sub(o).min(row) / e * e;
-                if n > 0 {
-                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
+                for x in 0..l.width {
+                    let offset = l.offset + self.layout.offset_z(x + l.origin.0, y + l.origin.1, slice, l.pitch);
+                    if let Some(bytes) = src.get(offset..offset + e) {
+                        out[(y * l.width + x) * e..][..e].copy_from_slice(bytes);
+                    }
                 }
             }
             return out;
         }
-        // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
-        // depends on y (and the slice) once per row – per element only two lookups and an XOR.
-        // Element by element it was most of a retail game's render thread while it streamed
-        // textures the CPU writes.
-        let hi = |tab: &[u32], c: usize, b: usize| tab[(c / b) % tab.len()];
-        let pitch_blocks = l.pitch.div_ceil(t.block_w);
-        let columns: Vec<(usize, u32)> = (0..l.width)
-            .map(|x| {
-                let x = x + l.origin.0;
-                (x / t.block_w, t.ox[x % t.block_w] ^ hi(&t.hx, x, t.block_w))
-            })
-            .collect();
-        let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
-        for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
-            let y = y + l.origin.1;
-            let row_blocks = (y / t.block_h) * pitch_blocks;
-            let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
-            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
-                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
-                if let Some(s) = src.get(o..o + e) {
-                    dst.copy_from_slice(s);
-                }
-            }
-        }
+        self.layout.detile_2d(src, &mut out, l.offset, l.width, l.height, l.pitch, l.origin, slice);
         out
     }
 
     /// linear rows of level `i` → its place in array slice `slice` (`dst`, `slice_bytes` long)
     pub fn tile_level(&self, dst: &mut [u8], i: usize, slice: usize, linear: &[u8]) {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
-                dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+        if self.layout.block_d != 1 {
+            let e = 1usize << self.layout.elem_log2;
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let offset = l.offset + self.layout.offset_z(x + l.origin.0, y + l.origin.1, slice, l.pitch);
+                    dst[offset..offset + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+                }
             }
+            return;
         }
+        self.layout.tile_2d(dst, linear, l.offset, l.width, l.height, l.pitch, l.origin, slice);
     }
 }
 
@@ -705,6 +892,15 @@ mod tests {
         let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
         assert_eq!(Layout::new_3d(24, 2, cfg).unwrap().block_d, 1);
         assert!(Layout::new_3d(10, 2, cfg).is_none() && Layout::new_3d(1, 2, cfg).is_none());
+
+        // The 2D block-slab fast path must not change the legacy single-slice helpers on a
+        // thick layout (volume callers normally use `tile_volume` / `detile_volume`).
+        let chain = Chain::new_3d(Layout::new_3d(5, 2, cfg).unwrap(), 19, 13, 4, 1, 1);
+        let level = chain.levels[0];
+        let linear: Vec<u8> = (0..level.width * level.height * 4).map(|i| (i * 37) as u8).collect();
+        let mut tiled = vec![0u8; chain.slice_bytes];
+        chain.tile_level(&mut tiled, 0, 1, &linear);
+        assert_eq!(chain.detile_level(&tiled, 0, 1), linear);
     }
 
     /// The three volume textures of the retail TTPF archive (4 KB tiles, thick): the space each
@@ -871,6 +1067,69 @@ mod tests {
         assert!(!g.contains_key(&(false, 99, 2, cfg)));
         assert!(!g.contains_key(&(false, 9, 5, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
         assert!(!g.contains_key(&(true, 10, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
+    }
+
+    #[test]
+    fn tile_level_matches_element_by_element_and_exploits_contiguous_runs() {
+        // Standard 2D modes with 1..4B elements must detect multi-element contiguous runs.
+        assert!(Layout::new(5, 0, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap().run_elems >= 4);
+        assert!(Layout::new(10, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap().run_elems >= 2);
+        for mode in MODES {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let mut lay = Layout::new(mode, e, cfg).unwrap();
+                    lay.base_xor = (lay.block_bytes / 2) & !((1 << e) - 1);
+                    let c = Chain::new(lay, 77, 45, 1, 7);
+                    let es = 1usize << e;
+                    for (k, l) in c.levels.iter().enumerate() {
+                        let lin: Vec<u8> = (0..l.width * l.height * es).map(|i| ((i * 53 + k * 17) % 251) as u8 | 1).collect();
+                        for slice in [0usize, 3] {
+                            let mut got = vec![0u8; c.slice_bytes];
+                            let mut want = vec![0u8; c.slice_bytes];
+                            c.tile_level(&mut got, k, slice, &lin);
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at(l, x, y, slice);
+                                    want[o..o + es].copy_from_slice(&lin[(y * l.width + x) * es..][..es]);
+                                }
+                            }
+                            assert!(got == want, "tile_level mismatch: mode {mode} e {e} {cfg:?} level {k} slice {slice}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn low_base_xor_bits_bound_runs_without_changing_bytes() {
+        for (mode, e) in [(5, 0u32), (10, 2)] {
+            let es = 1usize << e;
+            for cfg in configs() {
+                let plain = Layout::new(mode, e, cfg).unwrap();
+                for xor in [es, 3 * es, plain.block_bytes / 2] {
+                    let mut layout = plain;
+                    layout.base_xor = xor;
+                    if xor == es {
+                        assert_eq!(layout.effective_run(), 1, "mode {mode} e {e} {cfg:?}");
+                    }
+                    let chain = Chain::new(layout, 77, 45, 1, 1);
+                    let level = chain.levels[0];
+                    let linear: Vec<u8> = (0..level.width * level.height * es).map(|i| (i * 53 % 251) as u8).collect();
+                    let mut tiled = vec![0u8; chain.slice_bytes];
+                    chain.tile_level(&mut tiled, 0, 0, &linear);
+                    let mut want = vec![0u8; chain.slice_bytes];
+                    for y in 0..level.height {
+                        for x in 0..level.width {
+                            let offset = chain.element_at(&level, x, y, 0);
+                            want[offset..offset + es].copy_from_slice(&linear[(y * level.width + x) * es..][..es]);
+                        }
+                    }
+                    assert_eq!(tiled, want, "mode {mode} e {e} {cfg:?} xor {xor:#x}");
+                    assert_eq!(chain.detile_level(&tiled, 0, 0), linear, "mode {mode} e {e} {cfg:?} xor {xor:#x}");
+                }
+            }
+        }
     }
 }
 
