@@ -410,9 +410,17 @@ pub fn enabled() -> bool {
     std::env::var("XCL_PER_LANE").is_ok_and(|v| v == "1")
 }
 
+/// Maximum DXIL size (512 KiB) accepted from the per-lane compute lowering before
+/// `pso::direct_compute` tries the per-instruction direct DXIL path (which supports
+/// `compact` table lowering and `split_compute` dispatch chains).
+pub(crate) const MAX_COMPUTE_DXIL_BYTES: usize = 512 << 10;
+
 /// A compute program in its per-lane form with the runtime's options `o` (`pso::direct_compute`):
 /// the container and its static samplers.
 pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
+    if crate::gpu::dxil::cfg::Cfg::build(code).is_ok_and(|cfg| crate::gpu::dxil::compact::large(&cfg)) {
+        return Err("large/branch-heavy compute program: deferring to per-instruction/compact direct DXIL".into());
+    }
     let mut insts = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {

@@ -1024,9 +1024,28 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     }
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
+    // (or when it produces oversized monolithic DXIL that per-instruction compact/split lowering shrinks).
     if super::lower_dxil::enabled() {
         match super::lower_dxil::compute_with(code, &cs, o) {
+            Ok(k) if k.dxil.len() <= super::lower_dxil::MAX_COMPUTE_DXIL_BYTES => {
+                crate::gpu::dxil::coverage::record_translated("CS per-lane");
+                dump_direct(blob, &k.dxil);
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
+            }
             Ok(k) => {
+                if let Ok(alt) = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64) {
+                    if alt.dispatch_chain.is_some() || alt.dxil.len() < k.dxil.len() {
+                        crate::xlog_info!(
+                            "[SHADER] per-lane DXIL {} B exceeded {} B cap – using per-instruction form ({} B, split={})",
+                            k.dxil.len(),
+                            super::lower_dxil::MAX_COMPUTE_DXIL_BYTES,
+                            alt.dxil.len(),
+                            alt.dispatch_chain.is_some()
+                        );
+                        dump_direct(blob, &alt.dxil);
+                        return Ok(Compiled { dispatch_chain: alt.dispatch_chain, dxil: alt.dxil, samplers: alt.static_samplers });
+                    }
+                }
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
                 dump_direct(blob, &k.dxil);
                 return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });

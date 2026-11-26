@@ -443,3 +443,12 @@ fn gpu_nested_compact_matches_plain_and_flat() {
         .expect("nested budget GPU run");
     assert_eq!((got3.sgpr, got3.vgpr, got3.scc), (plain3.sgpr, plain3.vgpr, plain3.scc), "nested loop budget");
 }
+
+#[test]
+fn per_lane_compute_defers_branch_heavy_program_to_compact_path() {
+    let code = repeated(500);
+    let cs = crate::gpu::recomp::CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let err = crate::gpu::recomp::lower_dxil::compute_with(&code, &cs, o).err().expect("branch-heavy program must defer from per-lane to compact direct DXIL");
+    assert!(err.contains("deferring to per-instruction/compact"), "{err}");
+}

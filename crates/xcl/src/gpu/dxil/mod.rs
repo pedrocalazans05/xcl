@@ -13,7 +13,7 @@
 
 pub mod bitstream;
 pub mod cfg;
-mod compact;
+pub(crate) mod compact;
 pub mod container;
 pub mod coverage;
 pub mod graphics;
