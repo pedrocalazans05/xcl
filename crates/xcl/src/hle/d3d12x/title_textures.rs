@@ -20,7 +20,7 @@
 //! (`note_transitions`) and applied, in submission order, when the list is submitted
 //! (`submitted`) – per subresource once a transition names one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,11 +75,98 @@ static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 // raw COM pointers of the title's objects; uploads hold a reference while they run
 unsafe impl Send for Entry {}
 
+/// Size-tiered interval index over active textures' `src` byte spans `[src, src + size)`.
+///
+/// Grouping intervals by power-of-two size tier (`max_len = 2^tier`, minimum 4 KiB) lets each
+/// coalesced dirty-page run `[run_lo, run_hi)` query only `(run_lo - max_len)..run_hi` per
+/// non-empty tier, avoiding an `O(N_textures)` scan across 32k+ textures on every submit.
+struct SrcIndex {
+    tiers: BTreeMap<u8, BTreeMap<(usize, usize), usize>>,
+}
+
+impl SrcIndex {
+    const fn new() -> Self {
+        Self { tiers: BTreeMap::new() }
+    }
+
+    fn tier_of(size: usize) -> u8 {
+        if size == 0 {
+            0
+        } else {
+            let bits = (usize::BITS - (size - 1).leading_zeros()) as u8;
+            bits.max(12) + 1
+        }
+    }
+
+    fn tier_max_len(tier: u8) -> usize {
+        if tier == 0 {
+            0
+        } else {
+            let shift = (tier - 1) as u32;
+            if shift >= usize::BITS {
+                usize::MAX
+            } else {
+                1usize << shift
+            }
+        }
+    }
+
+    fn insert(&mut self, res: usize, src: usize, size: usize) {
+        let tier = Self::tier_of(size);
+        self.tiers.entry(tier).or_default().insert((src, res), src.saturating_add(size));
+    }
+
+    fn remove(&mut self, res: usize, src: usize, size: usize) {
+        let tier = Self::tier_of(size);
+        if let Some(map) = self.tiers.get_mut(&tier) {
+            map.remove(&(src, res));
+            if map.is_empty() {
+                self.tiers.remove(&tier);
+            }
+        }
+    }
+
+    /// Collect every indexed `res` whose `[src, src + size)` overlaps at least one dirty page
+    /// `[p, p + page)` in the sorted slice `dirty`.
+    fn collect_dirty(&self, dirty: &[usize], page: usize, out: &mut BTreeSet<usize>) {
+        if dirty.is_empty() || page == 0 || self.tiers.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < dirty.len() {
+            let run_lo = dirty[i];
+            let mut run_hi = run_lo.saturating_add(page);
+            i += 1;
+            while i < dirty.len() && dirty[i] <= run_hi {
+                run_hi = run_hi.max(dirty[i].saturating_add(page));
+                i += 1;
+            }
+            for (&tier, map) in &self.tiers {
+                let lo = run_lo.saturating_sub(Self::tier_max_len(tier));
+                for (&(src, res), &end) in map.range((lo, 0)..(run_hi, 0)) {
+                    if tier == 0 {
+                        let idx = dirty.partition_point(|&p| p.saturating_add(page) <= src);
+                        if dirty.get(idx).is_some_and(|&p| p < src) {
+                            out.insert(res);
+                        }
+                    } else if end > run_lo {
+                        out.insert(res);
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct Table {
     /// Active PC textures (newest at each range) → its place in the title's memory
     by_res: BTreeMap<usize, Entry>,
     /// Active `(va, PC texture)` → end address (`va + size`); entries with different `(va, end)` are disjoint
     by_va: BTreeMap<(usize, usize), usize>,
+    /// Active `!gpu_written` textures indexed by `src` span for `O(R log N + K)` dirty-page lookup
+    by_src: SrcIndex,
+    /// Active textures with `pending == true`
+    pending_res: BTreeSet<usize>,
     /// Older overlapped textures kept dormant until released or uncovered when a newer one is released
     shadowed: BTreeMap<usize, Entry>,
     /// Shadowed `(va, PC texture)` → end address (may overlap)
@@ -94,11 +181,119 @@ impl Table {
         Table {
             by_res: BTreeMap::new(),
             by_va: BTreeMap::new(),
+            by_src: SrcIndex::new(),
+            pending_res: BTreeSet::new(),
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
         }
+    }
+
+    fn index_active(&mut self, res: usize, entry: &Entry) {
+        if !entry.gpu_written {
+            self.by_src.insert(res, entry.src, entry.tex.size() as usize);
+        }
+        if entry.pending {
+            self.pending_res.insert(res);
+        }
+    }
+
+    fn unindex_active(&mut self, res: usize, entry: &Entry) {
+        if !entry.gpu_written {
+            self.by_src.remove(res, entry.src, entry.tex.size() as usize);
+        }
+        self.pending_res.remove(&res);
+    }
+
+    fn mark_pending(&mut self, res: usize) -> bool {
+        if let Some(e) = self.by_res.get_mut(&res) {
+            if !e.gpu_written && !e.pending {
+                e.pending = true;
+                self.pending_res.insert(res);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn mark_gpu_written(&mut self, res: usize) -> bool {
+        if let Some(e) = self.by_res.get_mut(&res) {
+            if !e.gpu_written {
+                self.by_src.remove(res, e.src, e.tex.size() as usize);
+                e.gpu_written = true;
+                return true;
+            }
+            return false;
+        }
+        if let Some(e) = self.shadowed.get_mut(&res) {
+            if !e.gpu_written {
+                e.gpu_written = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Re-evaluate `src` for GPU-view entries, keeping `by_src` and `pending_res` in sync.
+    fn recheck_gpu_view_sources(&mut self) -> bool {
+        let mut changed = false;
+        let updates: Vec<(usize, usize, usize, usize)> = self
+            .by_res
+            .iter()
+            .filter_map(|(&res, e)| {
+                if !e.in_gpu_view {
+                    return None;
+                }
+                let new_src = mirror_source(e.va);
+                (new_src != e.src).then_some((res, e.src, new_src, e.tex.size() as usize))
+            })
+            .collect();
+        for (res, old_src, new_src, size) in updates {
+            if let Some(e) = self.by_res.get_mut(&res) {
+                if !e.gpu_written {
+                    self.by_src.remove(res, old_src, size);
+                    self.by_src.insert(res, new_src, size);
+                }
+                e.src = new_src;
+                if !e.pending {
+                    e.pending = true;
+                    self.pending_res.insert(res);
+                    PENDING.fetch_add(1, Ordering::Relaxed);
+                }
+                changed = true;
+            }
+        }
+        for e in self.shadowed.values_mut() {
+            changed |= recheck_source(e);
+        }
+        changed
+    }
+
+    /// Return every active `res` that is either `pending` or `!gpu_written` with a dirty page in
+    /// `[src, src + size)`. Clears `pending` on returned entries and returns `(matched, cleared_pending)`.
+    fn take_dirty_and_pending(&mut self, dirty: &[usize], page: usize) -> (Vec<usize>, usize) {
+        let mut matched = BTreeSet::new();
+        let mut cleared_pending = 0usize;
+        for res in std::mem::take(&mut self.pending_res) {
+            if let Some(e) = self.by_res.get_mut(&res) {
+                if e.pending {
+                    e.pending = false;
+                    cleared_pending += 1;
+                    matched.insert(res);
+                }
+            }
+        }
+        if !dirty.is_empty() {
+            let mut dirty_hits = BTreeSet::new();
+            self.by_src.collect_dirty(dirty, page, &mut dirty_hits);
+            for res in dirty_hits {
+                if self.by_res.get(&res).is_some_and(|e| !e.gpu_written) {
+                    matched.insert(res);
+                }
+            }
+        }
+        (matched.into_iter().collect(), cleared_pending)
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -146,6 +341,7 @@ impl Table {
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
+                self.unindex_active(ores, &old);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -182,6 +378,7 @@ impl Table {
         let mut to_unmap = Vec::new();
         if let Some(old) = self.by_res.remove(&res) {
             self.by_va.remove(&(old.va, res));
+            self.unindex_active(res, &old);
             if old.pending {
                 pending_delta -= 1;
             }
@@ -195,6 +392,7 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                self.unindex_active(ores, &old);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -225,6 +423,7 @@ impl Table {
             pending_delta += 1;
         }
         self.by_va.insert((va, res), end);
+        self.index_active(res, &entry);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -241,6 +440,7 @@ impl Table {
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
         self.by_va.remove(&(old.va, res));
+        self.unindex_active(res, &old);
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -268,6 +468,7 @@ impl Table {
                     pending_delta += 1;
                 }
                 self.by_va.insert((sva, sres), send);
+                self.index_active(sres, &e);
                 self.by_res.insert(sres, e);
             }
         }
@@ -426,14 +627,7 @@ fn recheck_gpu_view_sources() {
     if SEEN.swap(gen, Ordering::AcqRel) == gen {
         return;
     }
-    let mut changed = false;
-    // (the shadowed textures too: one comes back when the texture over it goes)
-    let mut g = TEXTURES.lock().unwrap();
-    let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-        changed |= recheck_source(e);
-    }
-    drop(g);
+    let changed = TEXTURES.lock().unwrap().recheck_gpu_view_sources();
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -473,19 +667,18 @@ pub fn note_gpu_write(res: usize) {
             }
         }
     }
-    let mut marked = false;
-    {
+    let marked = {
         let mut t = TEXTURES.lock().unwrap();
-        if let Some(e) = t.get_mut(res) {
-            if !e.gpu_written {
-                e.gpu_written = true;
-                GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
-                marked = true;
-            }
+        if t.mark_gpu_written(res) {
+            GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
-    }
+    };
     if marked {
         STREAM_RECHECK.lock().unwrap().remove(&res);
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -677,7 +870,14 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES
+        .lock()
+        .unwrap()
+        .by_res
+        .values()
+        .filter(|e| !e.gpu_written)
+        .map(|e| (e.src & !0xFFF, (e.src.saturating_add(e.tex.size() as usize).saturating_add(0xFFF)) & !0xFFF))
+        .collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -804,23 +1004,14 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
+        let (matched, cleared_pending) = t.take_dirty_and_pending(&dirty, page as usize);
+        if cleared_pending > 0 {
+            PENDING.fetch_sub(cleared_pending, Ordering::Relaxed);
+        }
+        matched
+            .into_iter()
+            .filter_map(|res| {
+                let e = t.by_res.get(&res)?;
                 let p = res as *mut c_void;
                 ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
@@ -1052,12 +1243,9 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
         {
             let mut t = TEXTURES.lock().unwrap();
             for res in changed {
-                if let Some(e) = t.by_res.get_mut(&res) {
-                    if !e.gpu_written && !e.pending {
-                        e.pending = true;
-                        PENDING.fetch_add(1, Ordering::Relaxed);
-                        queued += 1;
-                    }
+                if t.mark_pending(res) {
+                    PENDING.fetch_add(1, Ordering::Relaxed);
+                    queued += 1;
                 }
             }
         }
@@ -2629,5 +2817,148 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    /// Secondary `SrcIndex` + `pending_res` must match the naive linear scan over `by_res`
+    /// identically across boundaries, overlaps, aliased `src` addresses, `gpu_written` entries,
+    /// shadowing, removals, retirements, and re-insertions.
+    #[test]
+    fn src_index_matches_linear_scan_across_mutations() {
+        const PAGE: usize = 0x1000;
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let tex_256k = Arc::new(xg::Texture::new(&console_desc(3, 256, 256, 1, 1, 28, 0x105)).unwrap());
+        let mk = |va: usize, src: usize, tex: &Arc<xg::Texture>, pending: bool, gpu_written: bool, placed: bool| Entry {
+            device: 0,
+            va,
+            src,
+            in_gpu_view: src != va,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending,
+            gpu_written,
+            placed,
+            unmapped: false,
+            seq: 0,
+        };
+        let naive = |tbl: &Table, dirty: &[usize]| -> Vec<usize> {
+            tbl.by_res
+                .iter()
+                .filter(|(_, e)| {
+                    if e.pending {
+                        return true;
+                    }
+                    if e.gpu_written {
+                        return false;
+                    }
+                    let i = dirty.partition_point(|&p| p + PAGE <= e.src);
+                    dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                })
+                .map(|(&res, _)| res)
+                .collect()
+        };
+
+        let mut tbl = Table::new();
+        // Adjacent and overlapping src spans, including format aliases and mirrored GPU views.
+        tbl.insert(1, mk(0x10_0000, 0x10_0000, &tex_16k, false, false, true)); // [0x10_0000, 0x10_4000)
+        tbl.insert(2, mk(0x10_4000, 0x10_4000, &tex_16k, false, false, true)); // [0x10_4000, 0x10_8000)
+        tbl.insert(3, mk(0x20_0000, 0x20_0800, &tex_64k, false, false, false)); // unaligned [0x20_0800, 0x21_0800)
+        tbl.insert(4, mk(0x20_0000, 0x20_0800, &tex_64k, false, false, false)); // exact committed alias
+        tbl.insert(5, mk(0x80_0000, 0x10_0000, &tex_16k, false, false, true)); // GPU view sharing src with 1
+        tbl.insert(6, mk(0x30_0000, 0x30_0000, &tex_256k, true, false, true)); // pending
+        tbl.insert(7, mk(0x40_0000, 0x40_0000, &tex_16k, false, true, true)); // gpu_written, not pending
+        tbl.insert(8, mk(0x50_0000, 0x50_0000, &tex_16k, true, true, true)); // gpu_written, still pending first upload
+
+        // Check boundary pages: just before 1, last page of 1 (not touching 2), first page of 2,
+        // last unaligned tail page of 3/4, and page inside gpu_written 7.
+        let dirty = vec![0x0F_F000, 0x10_3000, 0x21_0000, 0x40_1000];
+        let expected = naive(&tbl, &dirty);
+        let (got, cleared) = tbl.take_dirty_and_pending(&dirty, PAGE);
+        assert_eq!(got, expected);
+        assert_eq!(got, vec![1, 3, 4, 5, 6, 8]);
+        assert_eq!(cleared, 2);
+
+        // After pending cleared, a second query with no dirty pages returns nothing.
+        assert_eq!(tbl.take_dirty_and_pending(&[], PAGE), (vec![], 0));
+
+        // Mark 1 as gpu_written and verify it is no longer returned on dirty hits.
+        assert!(tbl.mark_gpu_written(1));
+        let dirty2 = vec![0x10_0000, 0x10_4000];
+        let expected2 = naive(&tbl, &dirty2);
+        let (got2, _) = tbl.take_dirty_and_pending(&dirty2, PAGE);
+        assert_eq!(got2, expected2);
+        assert_eq!(got2, vec![2, 5]);
+
+        // Shadow 2 with a 64 KiB texture, then remove the newer texture to uncover 2.
+        tbl.insert(9, mk(0x10_4000, 0x10_4000, &tex_64k, false, false, true));
+        let expected3 = naive(&tbl, &[0x10_5000]);
+        let (got3, _) = tbl.take_dirty_and_pending(&[0x10_5000], PAGE);
+        assert_eq!(got3, expected3);
+        assert_eq!(got3, vec![9]);
+
+        let (removed, _, _) = tbl.remove(9);
+        assert!(removed);
+        // Uncovered 2 was unmapped so it became pending again.
+        let expected4 = naive(&tbl, &[]);
+        let (got4, cleared4) = tbl.take_dirty_and_pending(&[], PAGE);
+        assert_eq!(got4, expected4);
+        assert_eq!(got4, vec![2]);
+        assert_eq!(cleared4, 1);
+
+        // Retire range covering 2 and verify it disappears from index.
+        tbl.retire_range(0x10_4000, 0x10_8000);
+        let expected5 = naive(&tbl, &[0x10_4000]);
+        let (got5, _) = tbl.take_dirty_and_pending(&[0x10_4000], PAGE);
+        assert_eq!(got5, expected5);
+        assert!(got5.is_empty());
+
+        // Re-insert res 2 at a new address and mark pending via mark_pending.
+        tbl.insert(2, mk(0x60_0000, 0x60_0000, &tex_16k, false, false, true));
+        assert!(tbl.mark_pending(2));
+        let expected6 = naive(&tbl, &[0x10_4000]);
+        let (got6, cleared6) = tbl.take_dirty_and_pending(&[0x10_4000], PAGE);
+        assert_eq!(got6, expected6);
+        assert_eq!(got6, vec![2]);
+        assert_eq!(cleared6, 1);
+    }
+
+    /// 32,768 active textures across mixed size tiers: sparse dirty-page lookup must return exact
+    /// matches without scanning the whole table.
+    #[test]
+    fn src_index_scales_to_32k_textures() {
+        const PAGE: usize = 0x1000;
+        const N: usize = 32_768;
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_1m = Arc::new(xg::Texture::new(&console_desc(3, 512, 512, 1, 1, 28, 0x105)).unwrap());
+        let mut tbl = Table::new();
+        let mut addr = 0x1_0000_0000usize;
+        for i in 1..=N {
+            let tex = if i % 256 == 0 { &tex_1m } else { &tex_16k };
+            let sz = tex.size() as usize;
+            tbl.insert(
+                i,
+                Entry {
+                    device: 0,
+                    va: addr,
+                    src: addr,
+                    in_gpu_view: false,
+                    tex: Arc::clone(tex),
+                    states: vec![D3D12_RESOURCE_STATE_COMMON],
+                    pending: false,
+                    gpu_written: false,
+                    placed: true,
+                    unmapped: false,
+                    seq: 0,
+                },
+            );
+            addr += sz;
+        }
+        let target_a = tbl.by_res.get(&100).unwrap().src + 0x2000;
+        let target_b = tbl.by_res.get(&256).unwrap().src + 0x8_0000; // inside a 1 MiB texture
+        let target_c = tbl.by_res.get(&(N - 1)).unwrap().src;
+        let dirty = vec![target_a, target_b, target_c];
+        let (got, cleared) = tbl.take_dirty_and_pending(&dirty, PAGE);
+        assert_eq!(cleared, 0);
+        assert_eq!(got, vec![100, 256, N - 1]);
     }
 }
