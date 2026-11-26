@@ -276,6 +276,19 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Shader-resource view format for a composited `PresentX` plane: resolves typeless
+/// formats to a concrete view format while preserving concrete formats (including
+/// `*_UNORM_SRGB`, which D3D12 forbids viewing as `*_UNORM`).
+fn plane_srv_format(f: DXGI_FORMAT) -> DXGI_FORMAT {
+    match f {
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        _ => f,
+    }
+}
+
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     let raw = res as *mut c_void;
     let r = ID3D12Resource::from_raw_borrowed(&raw)?;
@@ -841,10 +854,20 @@ impl Compositor {
         slot: usize,
     ) -> bool {
         let first = slot % PRESENT_SLOTS * MAX_PLANES;
-        let Some((opaque_pso, blend_pso)) = self.psos_for(dev, dst_fmt) else { return false };
+        // The first plane supplies the swap format and is drawn as the opaque base.
+        // Retain its sRGB encoding even when overlays use a linear SRV.
+        let rtv_format = match planes {
+            [(_, base, _), _, ..] => match (base.Format, dst_fmt) {
+                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM) => base.Format,
+                (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM) => base.Format,
+                _ => dst_fmt,
+            },
+            _ => dst_fmt,
+        };
+        let Some((opaque_pso, blend_pso)) = self.psos_for(dev, rtv_format) else { return false };
         let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
         let rtv_desc = D3D12_RENDER_TARGET_VIEW_DESC {
-            Format: dst_fmt,
+            Format: rtv_format,
             ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
@@ -854,7 +877,7 @@ impl Compositor {
             let mut srv_cpu = srv_cpu_base;
             srv_cpu.ptr += (first + i) * self.srv_inc as usize;
             let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: swap_format(desc.Format).unwrap_or(desc.Format),
+                Format: plane_srv_format(desc.Format),
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 ..Default::default()
@@ -1771,12 +1794,9 @@ mod frame_dump_tests {
             let queue: ID3D12CommandQueue = dev
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
                 .unwrap();
-            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let mut comp = Compositor::new(&dev).unwrap();
 
-            let make_tex = |w: u32, h: u32, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+            let make_tex = |w: u32, h: u32, format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
                 let mut r: Option<ID3D12Resource> = None;
                 dev.CreateCommittedResource(
                     &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -1787,7 +1807,7 @@ mod frame_dump_tests {
                         Height: h,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Format: format,
                         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                         Flags: flags,
                         ..Default::default()
@@ -1799,107 +1819,83 @@ mod frame_dump_tests {
                 .unwrap();
                 r.unwrap()
             };
-            let upload_tex = |tex: &ID3D12Resource, w: u32, h: u32, fill: &dyn Fn(u32, u32) -> [u8; 4]| -> ID3D12Resource {
-                let pitch = (w * 4).div_ceil(256) * 256;
-                let mut up: Option<ID3D12Resource> = None;
-                dev.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
-                    D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC {
-                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                        Width: (pitch * h) as u64,
-                        Height: 1,
-                        DepthOrArraySize: 1,
-                        MipLevels: 1,
-                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                        ..Default::default()
-                    },
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut up,
-                )
-                .unwrap();
-                let up = up.unwrap();
-                let mut p: *mut c_void = std::ptr::null_mut();
-                up.Map(0, None, Some(&mut p)).unwrap();
-                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, (pitch * h) as usize);
-                for y in 0..h {
-                    for x in 0..w {
-                        let off = (y * pitch + x * 4) as usize;
-                        bytes[off..off + 4].copy_from_slice(&fill(x, y));
-                    }
-                }
-                up.Unmap(0, None);
-                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(tex),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-                };
-                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&up),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                            Offset: 0,
-                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                                Width: w,
-                                Height: h,
-                                Depth: 1,
-                                RowPitch: pitch,
-                            },
-                        },
-                    },
-                };
-                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
-                list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
-                list.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
-                up
-            };
-
-            let scene = make_tex(4, 4, D3D12_RESOURCE_FLAG_NONE);
-            let ui = make_tex(8, 8, D3D12_RESOURCE_FLAG_NONE);
-            let out = make_tex(8, 8, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-            let _up0 = upload_tex(&scene, 4, 4, &|_, _| [0, 0, 255, 255]);
-            let _up1 = upload_tex(&ui, 8, 8, &|x, y| {
-                if y == 2 && x < 4 {
-                    [0, 128, 0, 128]
-                } else if x < 4 {
-                    [0, 0, 0, 0]
-                } else {
-                    [255, 0, 0, 255]
-                }
-            });
-
-            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
-            let planes = [
-                (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
-                (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+            let cases = [
+                (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    [0, 0, 255, 255], [0, 128, 0, 128], [0, 128, 127, 255]),
+                // Offscreen typeless storage supports either view of the same format family.
+                // Both 137 sRGB and 64 UNORM encode premultiplied green of about 0.25.
+                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                    [188, 128, 0, 255], [0, 137, 0, 128], [137, 161, 0, 255]),
+                (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                    [188, 128, 0, 255], [0, 64, 0, 128], [137, 161, 0, 255]),
+                (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                    [0, 0, 255, 255], [0, 137, 0, 128], [0, 64, 127, 255]),
+                (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_TYPELESS,
+                    [188, 128, 0, 255], [0, 64, 0, 128], [137, 161, 0, 255]),
             ];
-            assert!(comp.record(&dev, &list, &out, 8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
-            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            let out_desc = out.GetDesc();
-            let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
-            list.Close().unwrap();
+            for (scene_format, ui_format, target_format, scene_color, blend_color, expected_blend) in cases {
+                let output_format = swap_format(scene_format).unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                let upload_tex = |tex: &ID3D12Resource, fill: &dyn Fn(u32, u32) -> [u8; 4]| {
+                    let desc = tex.GetDesc();
+                    let mut data = Vec::with_capacity(desc.Width as usize * desc.Height as usize * 4);
+                    for y in 0..desc.Height {
+                        for x in 0..desc.Width as u32 {
+                            data.extend_from_slice(&fill(x, y));
+                        }
+                    }
+                    let sub = crate::gpu::texture::Subresource { row_bytes: desc.Width as usize * 4, rows: desc.Height as usize, depth: 1, data };
+                    crate::gpu::texture::record_upload(&dev, &list, tex, &[sub], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON).unwrap()
+                };
 
-            let cl: ID3D12CommandList = list.cast().unwrap();
-            queue.ExecuteCommandLists(&[Some(cl)]);
-            queue.Signal(&fence, 1).unwrap();
-            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+                let scene = make_tex(4, 4, scene_format, D3D12_RESOURCE_FLAG_NONE);
+                let ui = make_tex(8, 8, ui_format, D3D12_RESOURCE_FLAG_NONE);
+                let out = make_tex(8, 8, target_format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+                let _up0 = upload_tex(&scene, &|_, _| scene_color);
+                let _up1 = upload_tex(&ui, &|x, y| {
+                    if y == 2 && x < 4 {
+                        blend_color
+                    } else if x < 4 {
+                        [0, 0, 0, 0]
+                    } else {
+                        [255, 0, 0, 255]
+                    }
+                });
 
-            let mut p: *mut c_void = std::ptr::null_mut();
-            rb.Map(0, None, Some(&mut p)).unwrap();
-            let px = |x: usize, y: usize| -> [u8; 4] {
-                let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
-                let s = std::slice::from_raw_parts((p as *const u8).add(off), 4);
-                [s[0], s[1], s[2], s[3]]
-            };
-            assert_eq!(px(1, 1), [0, 0, 255, 255], "transparent UI exposes scene plane");
-            assert_eq!(px(6, 1), [255, 0, 0, 255], "opaque UI overwrites scene plane");
-            let blend = px(1, 2);
-            assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
-            rb.Unmap(0, None);
+                list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                let planes = [
+                    (scene.clone(), scene.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+                    (ui.clone(), ui.GetDesc(), [0.0, 0.0, 1.0, 1.0]),
+                ];
+                assert!(comp.record(&dev, &list, &out, 8, 8, output_format, &planes, 0));
+                list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                let out_desc = D3D12_RESOURCE_DESC { Format: output_format, ..out.GetDesc() };
+                let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
+                list.Close().unwrap();
+
+                let cl: ID3D12CommandList = list.cast().unwrap();
+                queue.ExecuteCommandLists(&[Some(cl)]);
+                queue.Signal(&fence, 1).unwrap();
+                fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+                let mut p: *mut c_void = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let px = |x: usize, y: usize| -> [u8; 4] {
+                    let off = fp.Offset as usize + y * fp.Footprint.RowPitch as usize + x * 4;
+                    std::slice::from_raw_parts((p as *const u8).add(off), 4).try_into().unwrap()
+                };
+                let (transparent, opaque, blend) = (px(1, 1), px(6, 1), px(1, 2));
+                rb.Unmap(0, None);
+
+                assert_eq!(transparent, scene_color, "transparent overlay with {scene_format:?} scene and {ui_format:?} UI");
+                assert_eq!(opaque, [255, 0, 0, 255], "opaque overlay with {scene_format:?} scene and {ui_format:?} UI");
+                assert!(
+                    blend[..3].iter().zip(expected_blend).all(|(&actual, expected)| actual.abs_diff(expected) <= 2) && blend[3] == expected_blend[3],
+                    "fractional overlay with {scene_format:?} scene and {ui_format:?} UI: expected {expected_blend:?}, got {blend:?}",
+                );
+            }
         }
     }
 
@@ -1936,5 +1932,140 @@ mod frame_dump_tests {
         // Zero window size falls back to uncapped; extreme aspect stays >= 1x1
         assert_eq!(cap_swapchain_size(3840, 2160, SwapchainCap::Window, 0, 0), (3840, 2160));
         assert_eq!(cap_swapchain_size(10000, 1, SwapchainCap::Max(100, 100), 100, 100), (100, 1));
+    }
+
+    #[test]
+    fn compositor_preserves_concrete_srgb_plane_srv_format() {
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB), DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R8G8B8A8_TYPELESS), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_B8G8R8A8_TYPELESS), DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R10G10B10A2_TYPELESS), DXGI_FORMAT_R10G10B10A2_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R16G16B16A16_TYPELESS), DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R8G8B8A8_UNORM), DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(plane_srv_format(DXGI_FORMAT_R16G16B16A16_FLOAT), DXGI_FORMAT_R16G16B16A16_FLOAT);
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut comp = Compositor::new(&dev).unwrap();
+
+            let make_tex = |fmt: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 4,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: fmt,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+                r.unwrap()
+            };
+
+            let srgb = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, D3D12_RESOURCE_FLAG_NONE);
+            let out = make_tex(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            let mut up: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256 * 4,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut up,
+            )
+            .unwrap();
+            let up = up.unwrap();
+            let mut p: *mut c_void = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            let bytes = std::slice::from_raw_parts_mut(p as *mut u8, 256 * 4);
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    let off = y * 256 + x * 4;
+                    bytes[off..off + 4].copy_from_slice(&[188, 128, 0, 255]);
+                }
+            }
+            up.Unmap(0, None);
+            let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&srgb),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&up),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            list.ResourceBarrier(&[transition(&srgb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            list.ResourceBarrier(&[
+                transition(&srgb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+                transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            ]);
+
+            let planes = [(srgb.clone(), srgb.GetDesc(), [0.0, 0.0, 1.0, 1.0])];
+            assert!(comp.record(&dev, &list, &out, 4, 4, DXGI_FORMAT_R8G8B8A8_UNORM, &planes, 0));
+            list.ResourceBarrier(&[transition(&out, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let out_desc = out.GetDesc();
+            let (rb, fp) = readback_copy(&list, &out, &out_desc).unwrap();
+            list.Close().unwrap();
+
+            let cl: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 1).unwrap();
+            fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut rp: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut rp)).unwrap();
+            let off = fp.Offset as usize + fp.Footprint.RowPitch as usize + 4;
+            let px = std::slice::from_raw_parts((rp as *const u8).add(off), 4);
+            let got = [px[0], px[1], px[2], px[3]];
+            rb.Unmap(0, None);
+            // Concrete R8G8B8A8_UNORM_SRGB sampled with an sRGB SRV decodes sRGB -> linear
+            // (~[128, 55, 0, 255]), whereas forcing UNORM fails SRV creation or skips sRGB decode.
+            assert!(
+                (125..=131).contains(&got[0]) && (52..=58).contains(&got[1]) && got[2] == 0 && got[3] == 255,
+                "expected sRGB-decoded concrete plane sample ~[128, 55, 0, 255], got {got:?}"
+            );
+        }
     }
 }
