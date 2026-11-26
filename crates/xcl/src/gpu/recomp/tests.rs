@@ -31,9 +31,19 @@ fn wave64_hardware() -> bool {
     w
 }
 
-/// `o` for a program run on this adapter (the split wave64 form where it is needed).
+/// `o` for a program run on this adapter (the split wave64 form where it is needed,
+/// or `hw_wave = 64` for wave32 compute/mesh programs on wave64-only GPUs like Polaris).
 fn on_gpu(o: Options) -> Options {
-    Options { split_wave64: runner::split_for(&o.mode), ..o }
+    let hw_wave = if o.hw_wave == 0
+        && !o.wave64
+        && matches!(o.mode, Mode::Compute(_) | Mode::Mesh(_))
+        && runner::wave32_supported() == Ok(false)
+    {
+        64
+    } else {
+        o.hw_wave
+    };
+    Options { split_wave64: runner::split_for(&o.mode), hw_wave, ..o }
 }
 
 /// `runner::mesh_draw` needs mesh shaders (not every adapter with wave64 has them).
@@ -174,10 +184,61 @@ fn geometry_wave_path_selection_preserves_native_wave64() {
     assert!(super::pso::wave32_only(32, 32));
     assert!(!super::pso::wave32_only(32, 64));
     assert!(!super::pso::wave32_only(64, 64));
+    assert!(!super::pso::wave64_only(32, 32));
+    assert!(!super::pso::wave64_only(32, 64));
+    assert!(super::pso::wave64_only(64, 64));
     // a VS / PS: the driver picks, so any range with 32 lanes gets the 32-lane form (#42)
     assert!(super::pso::graphics_wave32(32, 32));
     assert!(super::pso::graphics_wave32(32, 64));
     assert!(!super::pso::graphics_wave32(64, 64));
+}
+
+/// Wave32 compute shaders on wave64-only GPUs (AMD Polaris/GCN, `WaveLaneCountMin >= 64`):
+/// compiled with `[WaveSize(64)]` and `xcl_w32` / `xcl_half`, running two independent 32-lane
+/// console waves inside one hardware wave64 without leaking `ballot` or `v_readfirstlane`
+/// across halves, for both 1D (`[32, 1, 1]`) and 2D reordered (`[8, 8, 1]`) thread groups.
+#[test]
+fn gpu_compute_wave32_in_wave64_halves() {
+    if !gpu_ready() || runner::wave64_supported() != Ok(true) {
+        return;
+    }
+    // Compute linear thread index gi = v1 * s0 + v0 (s0 = threads.x):
+    //   v2 = v1 * s0 + v0  (gi)
+    //   v3 = v2 & 31       (console lane within 32-lane wave)
+    //   vcc = (16 > v3)    (wave32 ballot: must be 0x0000_FFFF in BOTH halves!)
+    //   s2 = v_readfirstlane_b32(v2) (must be 0 for half 0 and 32 for half 1!)
+    //   mem[v2 * 2 + 0] = vcc_lo
+    //   mem[v2 * 2 + 1] = s2
+    let p = prog(&[
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 2), ("SRC0", 257), ("SRC1", 0), ("SRC2", 256)], None),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 159), ("VSRC1", 2)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 3)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 258)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 131), ("VSRC1", 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for threads in [[32u32, 1, 1], [8, 8, 1]] {
+        let total = (threads[0] * threads[1] * threads[2]) as usize;
+        let cs = super::CsInterface { threads, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 2 };
+        let opt = Options { mode: Mode::Compute(cs), wave64: false, hw_wave: 64, ..Default::default() };
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("[WaveSize(64)]"), "must emit WaveSize(64) for wave64-only GPU:\n{}", t.hlsl);
+        assert!(!t.hlsl.contains("[WaveSize(32)]"), "must not emit WaveSize(32):\n{}", t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut io = vec![0u32; 128];
+        io[0] = threads[0];
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0xDEAD_BEEFu32; total * 2]).unwrap();
+        for gi in 0..total {
+            let expected_ballot = 0x0000_FFFFu32;
+            let expected_first = (gi & !31) as u32;
+            assert_eq!(mem[gi * 2], expected_ballot, "threads={threads:?} gi={gi} ballot");
+            assert_eq!(mem[gi * 2 + 1], expected_first, "threads={threads:?} gi={gi} readfirstlane");
+        }
+    }
 }
 
 #[test]

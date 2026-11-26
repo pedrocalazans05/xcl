@@ -108,7 +108,7 @@ fn replay_sample_dxil_forms() {
     }
     if let Some(path) = &sample.chain_program {
         let code = std::fs::read(dir.join(path)).unwrap();
-        let c = direct_compute(&code, 0, super::super::HEAP_WINDOWS | 4, true).unwrap();
+        let c = direct_compute(&code, 0, super::super::HEAP_WINDOWS | 4, true, false).unwrap();
         assert!(c.dxil == programs[0] && c.samplers.is_empty());
         let chain = c.dispatch_chain.as_ref().expect("fixture should split");
         runner::profile_buffer_forms(&c.dxil, [chain, chain], sample.groups, &sample.sgprs, &input,
@@ -141,7 +141,7 @@ fn replay_sample_buffer_chain() {
     let words = |b: &[u8]| b.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect::<Vec<_>>();
     let mem = words(&read(&cfg.memory));
     let expected = words(&read(&cfg.positions));
-    let compiled = direct_compute(&read(&cfg.program), 0, super::super::HEAP_WINDOWS | 4, true).unwrap();
+    let compiled = direct_compute(&read(&cfg.program), 0, super::super::HEAP_WINDOWS | 4, true, false).unwrap();
     let chain = compiled.dispatch_chain.as_ref().unwrap();
     assert!(compiled.samplers.is_empty());
     let reference = runner::dispatch(&compiled.dxil, cfg.groups, &cfg.sgprs, &mem).unwrap();
@@ -200,7 +200,7 @@ fn profile_sample_cold_compute() {
     let Some(path) = std::env::var_os("XCL_SAMPLE_COLD_COMPUTE") else { return };
     let bytes = std::fs::read(path).unwrap();
     let translate_start = Instant::now();
-    let compiled = direct_compute(&bytes, 0, super::super::HEAP_WINDOWS | 4, true).unwrap();
+    let compiled = direct_compute(&bytes, 0, super::super::HEAP_WINDOWS | 4, true, false).unwrap();
     println!("TRANSLATE bytes={} ms={:.3}", compiled.dxil.len(), translate_start.elapsed().as_secs_f64() * 1000.0);
     let workers: usize = std::env::var("XCL_SAMPLE_BUILD_WORKERS").unwrap_or_else(|_| "4".into()).parse().unwrap();
     assert!(workers > 0);

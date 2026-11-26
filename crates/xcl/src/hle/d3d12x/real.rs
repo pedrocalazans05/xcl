@@ -452,6 +452,18 @@ fn wave32_only(device: *mut c_void) -> bool {
     }
 }
 
+/// The device runs only 64-lane waves (e.g. AMD Polaris/GCN): wave32 compute and mesh programs
+/// run as two 32-lane halves inside `[WaveSize(64)]`. Unknown device: assume false.
+fn wave64_only(device: *mut c_void) -> bool {
+    if device.is_null() {
+        return false;
+    }
+    unsafe {
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return false };
+        crate::gpu::recomp::pso::wave64_only_for_device(dev)
+    }
+}
+
 /// Whether `device` runs on an AMD adapter (PCI vendor ID `0x1002`), cached per device pointer.
 fn is_amd_device(device: *mut c_void) -> bool {
     use windows::Win32::Graphics::Dxgi::*;
@@ -4570,7 +4582,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_for_waves, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -4583,7 +4595,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    let compiled = match console_to_dxil_for_waves(cs, Stage::Compute, 0, wave32_only(this), wave64_only(this)) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -5025,14 +5037,14 @@ mod compute_blob_tests {
     #[test]
     fn recorded_split_selects_cached_whole_or_pieces() {
         use super::*;
-        use crate::gpu::recomp::pso::{console_to_dxil_for, Stage};
+        use crate::gpu::recomp::pso::{console_to_dxil_for_waves, Stage};
         let Some(input) = std::env::var_os("XCL_SAMPLE_RUNTIME_COMPUTE") else { return };
         let cache = std::path::PathBuf::from(std::env::var_os("XCL_DXIL_CACHE").expect("private empty replay cache"));
         let mode = std::env::var("XCL_SAMPLE_CACHE_CASE").unwrap();
         assert_eq!(super::super::backend(), super::super::Backend::Real);
         let raw = device_raw();
         let code = std::fs::read(input).unwrap();
-        let c = console_to_dxil_for(&code, Stage::Compute, 0, wave32_only(raw)).unwrap();
+        let c = console_to_dxil_for_waves(&code, Stage::Compute, 0, wave32_only(raw), wave64_only(raw)).unwrap();
         assert!(c.dispatch_chain.is_some());
         let path = driver_cache::path(&c.dxil, 0).unwrap();
         assert!(path.starts_with(&cache));
@@ -6558,7 +6570,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 }
 
 unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_mesh_with_mode, is_console};
+    use crate::gpu::recomp::pso::{console_mesh_with_waves, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
     }
@@ -6599,7 +6611,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let console_ps = ps;
     let use_vs = !has_mesh_shaders(this);
-    let (tp, (ps, ps_samplers)) = match (console_mesh_with_mode(ms, ps, wave32_only(this), use_vs), two_pass_ps(ps, graphics_wave32(this))) {
+    let (tp, (ps, ps_samplers)) = match (console_mesh_with_waves(ms, ps, wave32_only(this), wave64_only(this), use_vs), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));

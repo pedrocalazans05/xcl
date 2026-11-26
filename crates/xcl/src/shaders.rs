@@ -1144,7 +1144,8 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
         .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
-    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
+    let wave64_only = !split && recomp::pso::wave64_only_for_device(&pipeline.dev);
+    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split, wave64_only).map_err(|e| Failed(format!("{name}: {e}")))?;
     let dxc_start = std::time::Instant::now();
     let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
     let dxc_ms = dxc_start.elapsed().as_millis();
@@ -1686,6 +1687,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let startup_device = pipelines.filter(|_| startup.is_some());
     let graphics_split = split.unwrap_or_else(|| startup_device.map_or_else(recomp::runner::graphics_wave32, |p| recomp::pso::graphics_wave32_for_device(&p.dev)));
     let split = split.unwrap_or_else(|| startup_device.map_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w), |p| recomp::pso::wave32_only_for_device(&p.dev)));
+    let wave64_only = !split && startup_device.map_or_else(|| recomp::runner::wave32_supported().is_ok_and(|w| !w), |p| recomp::pso::wave64_only_for_device(&p.dev));
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -1737,7 +1739,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         record_done();
                         continue;
                     }
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                    match recomp::pso::console_to_dxil_in_waves(&blob, recomp::pso::Stage::Compute, 0, split, wave64_only, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
@@ -1775,7 +1777,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let hw_wave = if wave64_only && matches!(mode, recomp::Mode::Compute(_) | recomp::Mode::Mesh(_)) { 64 } else { 0 };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, hw_wave, mem_windows: windows, ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
                             Ok(t) if t.complete() => t,
                             Ok(_) => {

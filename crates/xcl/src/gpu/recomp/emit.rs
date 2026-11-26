@@ -636,7 +636,7 @@ impl Em {
             Mode::Mesh(ms) => ms.threads,
             _ => return None,
         };
-        let hw_lanes = if self.x64() || !self.opt.wave64 { 32 } else { 64 };
+        let hw_lanes = if self.x64() { 32 } else if self.opt.wave64 || self.opt.hw_wave == 64 { 64 } else { 32 };
         Some(threads.div_ceil(hw_lanes).max(1))
     }
 
@@ -4975,16 +4975,19 @@ impl Em {
             }
             Mode::Compute(cs) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
+                // hw_wave 64 with a wave32 program (e.g. wave64-only Polaris/GCN): run two
+                // independent 32-lane console waves in one hardware `[WaveSize(64)]` wave.
+                let split_w32 = !self.opt.wave64 && self.opt.hw_wave == 64;
                 if self.uses_lds && !self.x64_lds() {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let [x, y, z] = cs.threads;
                 // split wave64: the same group in hardware wave32s (a console wave = two of them)
-                let hw_lanes = if self.x64() { 32 } else { lanes };
+                let hw_lanes = if self.x64() { 32 } else if split_w32 { 64 } else { lanes };
                 // 2-D / 3-D groups: the PC driver need not form its waves from consecutive
                 // thread indices (AMD RDNA4 lays them out in 2 x 2 quads: lanes 0, 1, 4, 5, 8 …
                 // of an 8 x 8 group; NVIDIA differs too), the console does – a hardware wave
-                // takes the next `lanes` console threads as it arrives, lane l the l-th of them
+                // takes the next `hw_lanes` console threads as it arrives, lane l the l-th of them
                 let reorder = !self.x64() && y * z > 1;
                 if reorder {
                     // console threads handed to waves so far: the program's top LDS word while
@@ -5008,6 +5011,14 @@ impl Em {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
+                } else if reorder && split_w32 {
+                    let t = x * y * z;
+                    let _ = writeln!(
+                        h,
+                        "    if (gi == 0u) XCL_WT = 0u;\n    GroupMemoryBarrierWithGroupSync();\n    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n    {{\n        bool full = WaveActiveCountBits(true) == 64u;\n        uint base = {}u;\n        if (WaveIsFirstLane() && full) InterlockedAdd(XCL_WT, 64u, base);\n        uint xcl_tid = WaveReadLaneFirst(base) + xcl_hw_lane;\n        gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n        gi = xcl_tid;\n    }}\n    GroupMemoryBarrierWithGroupSync(); // all waves have their threads before the program writes LDS",
+                        t & !63u32,
+                        x * y
+                    );
                 } else if reorder {
                     let t = x * y * z;
                     let _ = writeln!(
@@ -5016,6 +5027,8 @@ impl Em {
                         t & !(lanes - 1),
                         x * y
                     );
+                } else if split_w32 {
+                    h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
@@ -5052,7 +5065,9 @@ impl Em {
             }
             Mode::Mesh(ms) => {
                 // split wave64: each console wave in two hardware wave32s (`PRELUDE_X64`)
-                let native_lanes = if !self.opt.wave64 || self.x64() { 32 } else { 64 };
+                // hw_wave 64 with a wave32 program: two independent 32-lane halves in `[WaveSize(64)]`
+                let split_w32 = !self.opt.wave64 && self.opt.hw_wave == 64;
+                let native_lanes = if self.x64() { 32 } else if self.opt.wave64 || split_w32 { 64 } else { 32 };
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds && !self.x64_lds() {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
@@ -5067,6 +5082,8 @@ impl Em {
                     // the console thread's index (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     h.push_str("    gi = xcl_tid;\n");
+                } else if split_w32 {
+                    h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }

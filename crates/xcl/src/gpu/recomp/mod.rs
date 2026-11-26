@@ -502,8 +502,9 @@ pub struct Options {
     pub mode: Mode,
     /// wave64 (64-bit EXEC/VCC) or wave32 program
     pub wave64: bool,
-    /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
-    /// two independent halves – the wave-size independent form VS/PS always get (tests)
+    /// kernel / compute / mesh modes: 64 forces `[WaveSize(64)]` for a wave32 program, which then
+    /// runs as two independent 32-lane halves (`xcl_w32` / `xcl_half`) – the wave-size independent
+    /// form VS/PS always get (used on wave64-only GPUs such as AMD Polaris/GCN and in tests)
     pub hw_wave: u32,
     /// the GPU runs only 32-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`
     /// < 64, e.g. NVIDIA): each console wave of a wave64 kernel / compute / mesh / geometry
@@ -1374,7 +1375,11 @@ pub fn translate_geometry(code: &[u8], interface: GsInterface, split_wave64: boo
 /// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS – with
 /// one, a program reading title memory above the first window read the wrong memory.
 pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
-    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
+    translate_mesh_with_hw_wave(code, ms, wave64, split_wave64, 0, mem_windows)
+}
+
+pub fn translate_mesh_with_hw_wave(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool, hw_wave: u32, mem_windows: u32) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, hw_wave, split_wave64, mem_windows, ..Default::default() })
 }
 
 /// Wave size of an FSSM's program: wave32 when its header says so (`Fssm::wave32`), else by

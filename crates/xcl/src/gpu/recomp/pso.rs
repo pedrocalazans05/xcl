@@ -141,7 +141,14 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
 /// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
 pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
-    console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
+    console_to_dxil_for_waves(blob, stage, sampler_base, split_wave64, false)
+}
+
+/// `console_to_dxil_for` with `wave64_only` (`wave64_only_for_device`, e.g. AMD Polaris/GCN):
+/// a wave32 compute program runs as two 32-lane halves inside `[WaveSize(64)]` instead of
+/// `[WaveSize(32)]`, which wave64-only drivers reject with `E_INVALIDARG`.
+pub fn console_to_dxil_for_waves(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, wave64_only: bool) -> Result<Compiled, String> {
+    console_to_dxil_in_waves(blob, stage, sampler_base, split_wave64, wave64_only, mem_windows())
 }
 
 /// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
@@ -153,21 +160,28 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    console_to_dxil_in_waves(blob, stage, sampler_base, split_wave64, false, windows)
+}
+
+pub fn console_to_dxil_in_waves(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, wave64_only: bool, windows: u32) -> Result<Compiled, String> {
+    let wave64_only = wave64_only && !split_wave64 && stage == Stage::Compute;
+    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64, wave64_only);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
     }
+    let wave_mode = if split_wave64 { 1u8 } else if wave64_only { 2u8 } else { 0u8 };
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
         stage,
         sampler_base,
         windows,
         split_wave64,
+        wave64_only,
         cache_dir: dxc::cache_dir(),
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached_with_wave(&dxc::cache_dir(), blob, stage, sampler_base, windows, wave_mode, compile_one);
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -284,11 +298,16 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
-    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+    pub(super) fn file_with_wave(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, wave_mode: u8) -> PathBuf {
         dir.join("translated")
             .join("v2")
             .join(format!("{ident:016x}"))
-            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{wave_mode}.bin", crate::gpu::shader::fnv64(blob)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+        file_with_wave(dir, ident, blob, stage, sampler_base, windows, split as u8)
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -477,6 +496,7 @@ mod translated {
     /// `translate` through the disk (`identity()` zero: not used). An enormous compute program
     /// the direct translator made (`translate` says so) is kept under `rerouted_identity`, which
     /// follows that translator's version: the HLSL path's identity does not.
+    #[cfg(test)]
     pub(super) fn cached(
         dir: &Path,
         blob: &[u8],
@@ -486,7 +506,19 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_with_wave(dir, blob, stage, sampler_base, windows, split as u8, translate)
+    }
+
+    pub(super) fn cached_with_wave(
+        dir: &Path,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        wave_mode: u8,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
+        cached_rerouted_with_wave(dir, identity(), direct_output(), blob, stage, sampler_base, windows, wave_mode, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -525,6 +557,7 @@ mod translated {
         identity_for(&format!("{ident:016x}"), &format!("xcl-enormous-direct-{direct:016x}"))
     }
 
+    #[cfg(test)]
     pub(super) fn cached_rerouted(
         dir: &Path,
         ident: u64,
@@ -536,17 +569,32 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
+        cached_rerouted_with_wave(dir, ident, direct, blob, stage, sampler_base, windows, split as u8, translate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cached_rerouted_with_wave(
+        dir: &Path,
+        ident: u64,
+        direct: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        wave_mode: u8,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
         if ident == 0 {
             return translate().map(|(c, _)| c);
         }
         let rerouted = rerouted_identity(ident, direct);
         for id in [ident, rerouted] {
-            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
+            if let Some(c) = load_in(&file_with_wave(dir, id, blob, stage, sampler_base, windows, wave_mode), id, blob) {
                 super::dxc::note_memory_hit();
                 return Ok(c);
             }
         }
-        let err_path = file(dir, rerouted, blob, stage, sampler_base, windows, split).with_extension("err");
+        let err_path = file_with_wave(dir, rerouted, blob, stage, sampler_base, windows, wave_mode).with_extension("err");
         if let Some(reason) = load_err_in(&err_path, rerouted, blob) {
             return Err(reason);
         }
@@ -556,7 +604,7 @@ mod translated {
                     let _ = std::fs::remove_file(&err_path);
                 }
                 let id = if direct { rerouted } else { ident };
-                store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
+                store_in(&file_with_wave(dir, id, blob, stage, sampler_base, windows, wave_mode), id, blob, &c);
                 Ok(c)
             }
             Err(reason) => {
@@ -582,14 +630,14 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, wave64_only: bool) -> Result<(Compiled, bool), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
-        match direct_compute(blob, sampler_base, windows, split_wave64) {
+        match direct_compute(blob, sampler_base, windows, split_wave64, wave64_only) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
                 return Ok((c, false));
@@ -612,12 +660,12 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64, wave64_only)?;
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
-        match direct_compute(blob, sampler_base, windows, split_wave64) {
+        match direct_compute(blob, sampler_base, windows, split_wave64, wave64_only) {
             Ok(c) => {
                 crate::xlog_info!(
                     "[SHADER] {:016x}: {} KB of HLSL would compile unoptimised – direct DXIL instead ({} KB)",
@@ -718,7 +766,7 @@ fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
 pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, mem_windows(), false).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, mem_windows(), false, false).map(|(t, p)| (t.hlsl, p))
 }
 
 /// Upper entry cap for `ShaderCache` (the 64 MiB byte limit is the primary bound; a retail game
@@ -732,6 +780,7 @@ struct ShaderKey {
     sampler_base: u32,
     windows: u32,
     split_wave64: bool,
+    wave64_only: bool,
     cache_dir: PathBuf,
 }
 
@@ -950,7 +999,7 @@ pub fn compute_threads(blob: &[u8]) -> Option<[u32; 3]> {
 /// The HLSL and profile a console program compiles from at pipeline creation (for
 /// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
 pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, windows, split_wave64, false).map(|(t, p)| (t.hlsl, p))
 }
 
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
@@ -963,13 +1012,16 @@ fn direct_fallback(stage: &str, err: &str) {
 
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
-fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool, wave64_only: bool) -> Result<Compiled, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
+    if !wave64 && wave64_only {
+        return Err("wave32 on wave64-only GPU".into());
+    }
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     // `XCL_PER_LANE=1`: the per-lane form first, #1426's per-instruction form where it refuses
     if super::lower_dxil::enabled() {
@@ -1025,13 +1077,14 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
 }
 
-pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, wave64_only: bool) -> Result<(super::Translation, &'static str), String> {
+    let hw_wave = if wave64_only { 64 } else { 0 };
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, hw_wave, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1060,7 +1113,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, hw_wave, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1116,9 +1169,10 @@ fn compile_console_mesh(
     wave64: bool,
     windows: u32,
     split_wave64: bool,
+    wave64_only: bool,
 ) -> Result<Compiled, String> {
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
+    if crate::gpu::dxil::kernel::enabled() && (wave64 || !wave64_only) {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -1137,7 +1191,8 @@ fn compile_console_mesh(
             Err(e) => direct_fallback("MS", &e),
         }
     }
-    let t = super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?;
+    let hw_wave = if wave64_only { 64 } else { 0 };
+    let t = super::translate_mesh_with_hw_wave(code, ms.clone(), wave64, split_wave64, hw_wave, windows)?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1151,6 +1206,7 @@ fn console_mesh_with(
     blob: &[u8],
     ps: Option<&[u8]>,
     split_wave64: bool,
+    wave64_only: bool,
     use_vs: bool,
     windows: u32,
     cache_dir: &std::path::Path,
@@ -1166,6 +1222,8 @@ fn console_mesh_with(
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
+    let w64_only = !wave64 && wave64_only;
+    let wave_mode = if split { 1u8 } else if w64_only { 2u8 } else { 0u8 };
     let compile_one = || compile(code, ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
     // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
@@ -1176,9 +1234,10 @@ fn console_mesh_with(
             sampler_base: 0,
             windows,
             split_wave64: split,
+            wave64_only: w64_only,
             cache_dir: cache_dir.to_path_buf(),
         };
-        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
+        let from_disk = || translated::cached_with_wave(cache_dir, blob, Stage::Mesh, 0, windows, wave_mode, || compile_one().map(|c| (c, false)));
         cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
     } else {
         compile_one()?
@@ -1195,10 +1254,15 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
 /// `console_mesh` with explicit pass-through mode (`use_vs = true` compiles a `vs_6_6`
 /// vertex-shader fallback instead of `ms_6_6`).
 pub fn console_mesh_with_mode(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, use_vs: bool) -> Result<TwoPass, String> {
+    console_mesh_with_waves(blob, ps, split_wave64, false, use_vs)
+}
+
+/// `console_mesh_with_mode` with explicit `wave64_only` flag for GPUs that only support 64-lane waves.
+pub fn console_mesh_with_waves(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, wave64_only: bool, use_vs: bool) -> Result<TwoPass, String> {
     let windows = mem_windows();
     let dir = dxc::cache_dir();
-    console_mesh_with(blob, ps, split_wave64, use_vs, windows, &dir, shader_cache(), |code, ms, wave64| {
-        compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
+    console_mesh_with(blob, ps, split_wave64, wave64_only, use_vs, windows, &dir, shader_cache(), |code, ms, wave64| {
+        compile_console_mesh(blob, code, ms, wave64, windows, split_wave64, wave64_only)
     })
 }
 
@@ -1229,6 +1293,12 @@ pub fn device_has_mesh_shaders(device: &ID3D12Device) -> bool {
 /// mesh and geometry programs then need the split form.
 pub fn wave32_only(wave_min: u32, wave_max: u32) -> bool {
     !(wave_min <= 64 && wave_max >= 64)
+}
+
+/// Whether the adapter runs only 64-lane waves (its wave range lacks 32, e.g. AMD Polaris/GCN):
+/// wave32 compute and mesh programs then run as two 32-lane halves inside `[WaveSize(64)]`.
+pub fn wave64_only(wave_min: u32, wave_max: u32) -> bool {
+    !(wave_min <= 32 && wave_max >= 32)
 }
 
 /// `XCL_SPLIT_WAVE64=1`: the split wave64 form also where the GPU has 64-lane waves – to check
@@ -1262,6 +1332,10 @@ fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
 
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
     split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| wave32_only(min, max))
+}
+
+pub fn wave64_only_for_device(device: &ID3D12Device) -> bool {
+    !split_wave64_forced() && wave_range(device).is_some_and(|(min, max)| wave64_only(min, max))
 }
 
 /// `graphics_wave32` for the device: the split flag for a wave64 VS / PS. Unknown: assume so.
@@ -1496,6 +1570,7 @@ mod shader_cache_tests {
             translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false),
             translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false),
             translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true),
+            translated::file_with_wave(&dir, 42, b"console", Stage::Compute, 3, 2, 2),
         ];
         assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), paths.len());
         assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
@@ -1715,6 +1790,7 @@ mod shader_cache_tests {
             sampler_base: 0,
             windows: 1,
             split_wave64: false,
+            wave64_only: false,
             cache_dir: "cache".into(),
         }
     }
@@ -1864,6 +1940,10 @@ mod shader_cache_tests {
                 ..original.clone()
             },
             ShaderKey {
+                wave64_only: true,
+                ..original.clone()
+            },
+            ShaderKey {
                 cache_dir: "other cache".into(),
                 ..original.clone()
             },
@@ -2006,9 +2086,9 @@ mod shader_cache_tests {
         let compiles = AtomicUsize::new(0);
 
         let run = |c: &Mutex<ShaderCache>| {
-            console_mesh_with(&blob, None, false, false, 1, &dir, c, |code, ms, wave64| {
+            console_mesh_with(&blob, None, false, false, false, 1, &dir, c, |code, ms, wave64| {
                 compiles.fetch_add(1, Ordering::SeqCst);
-                compile_console_mesh(&blob, code, ms, wave64, 1, false)
+                compile_console_mesh(&blob, code, ms, wave64, 1, false, false)
             })
         };
 
