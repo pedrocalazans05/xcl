@@ -1345,20 +1345,24 @@ impl Lw {
         }
 
         if base == "get_resinfo" && ms {
-            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself
+            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself.
+            // Query through `Texture2D` / `Texture2DArray` at mip 0 and force `mips = 1` rather
+            // than `Texture2DMS` / `Texture2DMSArray` `getDimensions`, which crashes AMD Polaris
+            // `amdxc64.dll` (`0x887a0020`) when heap-indexed.
             let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
             let z = self.c(0);
             for &t in &tmps {
                 self.wr(t, z);
             }
+            let query_kind = if dim == 7 { TexKind::D2Array } else { TexKind::D2 };
             self.guarded(run, &mut |lw| {
-                let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-                let dims = lw.s.get_dimensions(tex.handle, None);
+                let zero = lw.c(0);
+                let tex = lw.s.heap_texture(tw0, query_kind, false, CompType::F32, 4, true);
+                let dims = lw.s.get_dimensions(tex.handle, Some(zero));
                 let one = lw.c(1);
                 let w = lw.s.m.extract(dims, 0);
                 let hh = lw.s.m.extract(dims, 1);
                 // 2D MSAA: depth 0, as for every DIM without layers (RDNA2)
-                let zero = lw.c(0);
                 let dd = if dim == 7 { lw.s.m.extract(dims, 2) } else { zero };
                 for (k, v) in [w, hh, dd, one].into_iter().enumerate() {
                     lw.wr(tmps[k], v);
@@ -1378,29 +1382,29 @@ impl Lw {
                 self.wr(t, z);
             }
             // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
-            // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
-            // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
-            // the level count to the host (RADV: log2(samples) + 1).
+            // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). Query through
+            // `Texture2D` at mip 0 and force `(depth = 0, mips = 1)` rather than
+            // `Texture2DMS`/`Texture2DMSArray` `getDimensions` (crashes AMD Polaris `amdxc64.dll`).
             let mut run = run;
             if matches!(dim, 0 | 1) {
                 let rtype = self.lshrc(tw3, 28);
-                for (ty, mkind) in [(14, TexKind::D2MS), (15, TexKind::D2MSArray)] {
-                    let is = self.cmpc(Pred::Eq, rtype, ty);
-                    let go = self.land(run, is);
-                    self.guarded(go, &mut |lw| {
-                        let tex = lw.s.heap_texture(tw0, mkind, false, CompType::F32, 4, true);
-                        let dims = lw.s.get_dimensions(tex.handle, None);
-                        let w = lw.s.m.extract(dims, 0);
-                        let hh = lw.s.m.extract(dims, 1);
-                        let (zero, one) = (lw.c(0), lw.c(1));
-                        for (k, v) in [w, hh, zero, one].into_iter().enumerate() {
-                            lw.wr(tmps[k], v);
-                        }
-                        Ok(())
-                    })?;
-                }
-                let ms_t = self.cmpc(Pred::UGe, rtype, 14);
-                let not_ms = self.lnot(ms_t);
+                let is_14 = self.cmpc(Pred::Eq, rtype, 14);
+                let is_15 = self.cmpc(Pred::Eq, rtype, 15);
+                let is_ms = self.lor(is_14, is_15);
+                let go = self.land(run, is_ms);
+                self.guarded(go, &mut |lw| {
+                    let zero = lw.c(0);
+                    let tex = lw.s.heap_texture(tw0, TexKind::D2, false, CompType::F32, 4, true);
+                    let dims = lw.s.get_dimensions(tex.handle, Some(zero));
+                    let w = lw.s.m.extract(dims, 0);
+                    let hh = lw.s.m.extract(dims, 1);
+                    let one = lw.c(1);
+                    for (k, v) in [w, hh, zero, one].into_iter().enumerate() {
+                        lw.wr(tmps[k], v);
+                    }
+                    Ok(())
+                })?;
+                let not_ms = self.lnot(is_ms);
                 run = self.land(run, not_ms);
             }
             self.guarded(run, &mut |lw| {
