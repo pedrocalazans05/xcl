@@ -1018,6 +1018,69 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
+/// Opt-in swapchain resolution cap (`XCL_SWAPCHAIN_MAX_SIZE`):
+/// - unset / empty / `"0"` / `"off"` / `"none"`: uncapped (title's plane max)
+/// - `"window"`: clamp to the XCL window client size (`window_width × window_height`)
+/// - `"WxH"` (e.g. `"1920x1080"`, `"1280x720"`): clamp to `W × H` while preserving aspect ratio
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapchainCap {
+    None,
+    Window,
+    Max(u32, u32),
+}
+
+fn parse_swapchain_cap(raw: &str) -> Result<SwapchainCap, ()> {
+    let s = raw.trim();
+    if s.is_empty() || s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") {
+        return Ok(SwapchainCap::None);
+    }
+    if s.eq_ignore_ascii_case("window") {
+        return Ok(SwapchainCap::Window);
+    }
+    let (lw, lh) = s.split_once(['x', 'X']).ok_or(())?;
+    let w = lw.trim().parse::<u32>().map_err(|_| ())?;
+    let h = lh.trim().parse::<u32>().map_err(|_| ())?;
+    if w == 0 || h == 0 {
+        return Err(());
+    }
+    Ok(SwapchainCap::Max(w, h))
+}
+
+fn swapchain_cap() -> SwapchainCap {
+    static CAP: OnceLock<SwapchainCap> = OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("XCL_SWAPCHAIN_MAX_SIZE") {
+        Ok(raw) => match parse_swapchain_cap(&raw) {
+            Ok(cap) => cap,
+            Err(()) => {
+                crate::xlog_warn!("present: ignoring invalid XCL_SWAPCHAIN_MAX_SIZE={raw:?} (expected WxH, \"window\", or \"0\")");
+                SwapchainCap::None
+            }
+        },
+        Err(_) => SwapchainCap::None,
+    })
+}
+
+/// Clamp `(w, h)` to fit within `cap` while preserving aspect ratio and never upscaling.
+fn cap_swapchain_size(w: u32, h: u32, cap: SwapchainCap, win_w: u32, win_h: u32) -> (u32, u32) {
+    let (mw, mh) = match cap {
+        SwapchainCap::None => return (w, h),
+        SwapchainCap::Window if win_w > 0 && win_h > 0 => (win_w, win_h),
+        SwapchainCap::Window => return (w, h),
+        SwapchainCap::Max(mw, mh) => (mw, mh),
+    };
+    if w == 0 || h == 0 || (w <= mw && h <= mh) {
+        return (w, h);
+    }
+    let (w64, h64, mw64, mh64) = (w as u64, h as u64, mw as u64, mh as u64);
+    if w64 * mh64 >= h64 * mw64 {
+        let nh = ((h64 * mw64 + w64 / 2) / w64).clamp(1, mh64) as u32;
+        (mw, nh)
+    } else {
+        let nw = ((w64 * mh64 + h64 / 2) / h64).clamp(1, mw64) as u32;
+        (nw, mh)
+    }
+}
+
 unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
@@ -1071,13 +1134,21 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     if p.disabled || p.last.elapsed() < min_interval {
         return;
     }
-    let (w, h) = if resolved.len() == 1 {
+    let (raw_w, raw_h) = if resolved.len() == 1 {
         (resolved[0].1.Width as u32, resolved[0].1.Height)
     } else {
         let mw = resolved.iter().map(|(_, d, _)| d.Width as u32).max().unwrap_or(0);
         let mh = resolved.iter().map(|(_, d, _)| d.Height).max().unwrap_or(0);
         (mw, mh)
     };
+    let cfg = crate::state::config();
+    let (w, h) = cap_swapchain_size(raw_w, raw_h, swapchain_cap(), cfg.window_width, cfg.window_height);
+    if (w, h) != (raw_w, raw_h) {
+        static CAP_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !CAP_LOGGED.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("present: swap chain capped from {raw_w}x{raw_h} to {w}x{h} (XCL_SWAPCHAIN_MAX_SIZE)");
+        }
+    }
     let Some(fmt) = swap_format(resolved[0].1.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
@@ -1104,7 +1175,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     let mut composited = false;
-    if resolved.len() > 1 {
+    let needs_composite = resolved.len() > 1 || (resolved[0].1.Width as u32 != w || resolved[0].1.Height != h);
+    if needs_composite {
         if p.compositor.is_none() {
             p.compositor = Compositor::new(&p.dev);
         }
@@ -1829,5 +1901,40 @@ mod frame_dump_tests {
             assert!(blend[0] <= 2 && (126..=130).contains(&blend[1]) && (125..=129).contains(&blend[2]) && blend[3] == 255, "unexpected blend {blend:?}");
             rb.Unmap(0, None);
         }
+    }
+
+    #[test]
+    fn parse_swapchain_cap_accepts_wxh_window_and_disabled() {
+        assert_eq!(parse_swapchain_cap(""), Ok(SwapchainCap::None));
+        assert_eq!(parse_swapchain_cap("0"), Ok(SwapchainCap::None));
+        assert_eq!(parse_swapchain_cap("off"), Ok(SwapchainCap::None));
+        assert_eq!(parse_swapchain_cap("NONE"), Ok(SwapchainCap::None));
+        assert_eq!(parse_swapchain_cap("window"), Ok(SwapchainCap::Window));
+        assert_eq!(parse_swapchain_cap(" WINDOW "), Ok(SwapchainCap::Window));
+        assert_eq!(parse_swapchain_cap("1920x1080"), Ok(SwapchainCap::Max(1920, 1080)));
+        assert_eq!(parse_swapchain_cap(" 1280 X 720 "), Ok(SwapchainCap::Max(1280, 720)));
+
+        assert!(parse_swapchain_cap("0x1080").is_err());
+        assert!(parse_swapchain_cap("1920x0").is_err());
+        assert!(parse_swapchain_cap("1920").is_err());
+        assert!(parse_swapchain_cap("abcxdef").is_err());
+        assert!(parse_swapchain_cap("-1280x720").is_err());
+    }
+
+    #[test]
+    fn cap_swapchain_size_preserves_aspect_and_never_upscales() {
+        // Uncapped passthrough
+        assert_eq!(cap_swapchain_size(3840, 2160, SwapchainCap::None, 1280, 720), (3840, 2160));
+        // Exact 16:9 downscales (e.g. 4K UI + 1080p scene multi-plane max -> 1080p or 720p)
+        assert_eq!(cap_swapchain_size(3840, 2160, SwapchainCap::Max(1920, 1080), 1280, 720), (1920, 1080));
+        assert_eq!(cap_swapchain_size(3840, 2160, SwapchainCap::Window, 1280, 720), (1280, 720));
+        // Aspect-ratio preservation when cap aspect differs from source aspect
+        assert_eq!(cap_swapchain_size(3840, 2160, SwapchainCap::Max(1280, 1024), 1280, 720), (1280, 720));
+        assert_eq!(cap_swapchain_size(1920, 1080, SwapchainCap::Max(1920, 720), 1280, 720), (1280, 720));
+        // Smaller than cap must not upscale
+        assert_eq!(cap_swapchain_size(1280, 720, SwapchainCap::Max(1920, 1080), 1920, 1080), (1280, 720));
+        // Zero window size falls back to uncapped; extreme aspect stays >= 1x1
+        assert_eq!(cap_swapchain_size(3840, 2160, SwapchainCap::Window, 0, 0), (3840, 2160));
+        assert_eq!(cap_swapchain_size(10000, 1, SwapchainCap::Max(100, 100), 100, 100), (100, 1));
     }
 }
