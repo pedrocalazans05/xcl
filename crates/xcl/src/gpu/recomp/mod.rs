@@ -63,7 +63,7 @@ pub mod mesh_wave;
 pub mod partition;
 pub mod x64_masks;
 pub mod pso;
-pub use emit::mesh_passthrough;
+pub use emit::{mesh_passthrough, vertex_passthrough};
 pub mod runner;
 pub mod ssa;
 #[cfg(test)]

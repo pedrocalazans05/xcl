@@ -427,4 +427,26 @@ mod tests {
         assert_ne!(k0, two_pass_cs_key(&cs, &[], 2, 1));
         assert_ne!(k0, two_pass_cs_key(&[11u8; 64], &[], 1, 1));
     }
+
+    #[test]
+    fn canonical_stream_key_handles_vs_and_distinguishes_vs_from_ms() {
+        let code = [1u8, 2, 3, 4];
+        let ps = [5u8, 6, 7, 8];
+        let mut s_ms = StreamOut::default();
+        s_ms.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &code);
+        s_ms.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        s_ms.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
+
+        let mut s_vs = StreamOut::default();
+        s_vs.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &code);
+        s_vs.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        s_vs.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
+
+        unsafe {
+            let k_ms = two_pass_stream_key(&s_ms.0, &[], 1, 1).expect("MS key");
+            let k_vs = two_pass_stream_key(&s_vs.0, &[], 1, 1).expect("VS key");
+            assert_eq!(k_vs.1, code.len() + ps.len());
+            assert_ne!(k_ms.0, k_vs.0, "VS fallback stream must have a distinct key from MS stream");
+        }
+    }
 }

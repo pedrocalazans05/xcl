@@ -606,8 +606,11 @@ fn split_halves_agree(raw: &[u32]) -> Result<(), String> {
 }
 
 /// Whether the adapter runs mesh shaders (`mesh_draw`); an integrated RDNA2 GPU, for one,
-/// reports wave64 but no mesh shader tier.
+/// reports wave64 but no mesh shader tier. Respects `XCL_MESH_EMULATION=1`.
 pub fn mesh_shaders_supported() -> Result<bool, String> {
+    if super::pso::mesh_emulation_forced() {
+        return Ok(false);
+    }
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init);
     gpu.as_ref().map(|x| x.mesh).map_err(|x| x.clone())
@@ -1267,6 +1270,11 @@ struct MeshStream {
     samples: Sub<DXGI_SAMPLE_DESC>,
 }
 
+enum PassThrough<'a> {
+    Mesh { ms: &'a [u8], split: u32 },
+    Vertex { vs: &'a [u8], max_primitives: u32 },
+}
+
 /// Mesh mode, both passes: `cs` = the translated NGG program (writes one record of
 /// `record_dwords` per group into u1), `ms` = its pass-through mesh shader, `ps` = pixel
 /// shader; `groups` thread groups, initial SGPRs `sgprs` (u0), flat memory `mem` (u2).
@@ -1300,6 +1308,40 @@ pub fn mesh_draw_split(
     size: u32,
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    mesh_draw_impl(cs, PassThrough::Mesh { ms, split }, ps, groups, record_dwords, sgprs, mem, size, clear)
+}
+
+/// Vertex-shader (`vs_6_6`) pass-through version of `mesh_draw` for GPUs without hardware
+/// D3D12 mesh shaders (or `XCL_MESH_EMULATION=1`): `vs` is `emit::vertex_passthrough_for`
+/// compiled as `vs_6_6`, invoked with `DrawInstanced(max_primitives * 3, groups, 0, 0)`.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_vs(
+    cs: &[u8],
+    vs: &[u8],
+    ps: &[u8],
+    groups: u32,
+    max_primitives: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    mesh_draw_impl(cs, PassThrough::Vertex { vs, max_primitives }, ps, groups, record_dwords, sgprs, mem, size, clear)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mesh_draw_impl(
+    cs: &[u8],
+    pass: PassThrough<'_>,
+    ps: &[u8],
+    groups: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
@@ -1316,24 +1358,45 @@ pub fn mesh_draw_split(
         let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
         let mut rtv_formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
         rtv_formats.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        let mut stream = MeshStream {
-            rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: gpu.rs.as_raw() },
-            ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr() as _, BytecodeLength: ms.len() } },
-            ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() } },
-            blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
-            mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
-            rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
-            depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
-            rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
-            samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
+        let mpso: ID3D12PipelineState = match pass {
+            PassThrough::Mesh { ms, .. } => {
+                let mut stream = MeshStream {
+                    rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: gpu.rs.as_raw() },
+                    ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr() as _, BytecodeLength: ms.len() } },
+                    ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() } },
+                    blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
+                    mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
+                    rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+                    depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
+                    rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
+                    samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
+                };
+                let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
+                dev2.CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: std::mem::size_of::<MeshStream>(),
+                    pPipelineStateSubobjectStream: &mut stream as *mut MeshStream as *mut std::ffi::c_void,
+                })
+                .map_err(|x| format!("CreatePipelineState (mesh): {x}"))?
+            }
+            PassThrough::Vertex { vs, .. } => {
+                let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&gpu.rs),
+                    VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+                    PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                    BlendState: blend,
+                    SampleMask: u32::MAX,
+                    RasterizerState: rast,
+                    DepthStencilState: D3D12_DEPTH_STENCIL_DESC::default(),
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                dev.CreateGraphicsPipelineState(&desc)
+                    .map_err(|x| format!("CreateGraphicsPipelineState (vs passthrough): {x}"))?
+            }
         };
-        let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
-        let mpso: ID3D12PipelineState = dev2
-            .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
-                SizeInBytes: std::mem::size_of::<MeshStream>(),
-                pPipelineStateSubobjectStream: &mut stream as *mut MeshStream as *mut std::ffi::c_void,
-            })
-            .map_err(|x| format!("CreatePipelineState (mesh): {x}"))?;
 
         let tex = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -1369,7 +1432,7 @@ pub fn mesh_draw_split(
         let io_bytes = (io.len() * 4) as u64;
         let mem_len = mem.len().max(64);
         let mem_bytes = (mem_len * 4) as u64;
-        let res_len = record_dwords * groups as usize;
+        let res_len = (record_dwords * groups as usize).max(64);
         let res_bytes = (res_len * 4) as u64;
         let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
@@ -1414,8 +1477,19 @@ pub fn mesh_draw_split(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
-        list6.DispatchMesh(groups * split, 1, 1);
+        match pass {
+            PassThrough::Mesh { split, .. } => {
+                let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
+                list6.DispatchMesh(groups * split, 1, 1);
+            }
+            PassThrough::Vertex { max_primitives, .. } => {
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                let verts = max_primitives.saturating_mul(3);
+                if verts > 0 && groups > 0 {
+                    list.DrawInstanced(verts, groups, 0, 0);
+                }
+            }
+        }
         list.ResourceBarrier(&[
             transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),

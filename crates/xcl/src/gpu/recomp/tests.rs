@@ -3671,6 +3671,273 @@ fn mesh_passthrough_strips_rdna2_edge_flag_bits() {
     assert!(!split.contains("0x3FFu"), "{split}");
 }
 
+#[test]
+fn vertex_passthrough_compiles_standard_ps_filtered_clip_split_and_zero_mp() {
+    use super::{dxc, emit::vertex_passthrough_for, vertex_passthrough, MsInterface};
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let sig = |name: &str, sv: u32, ty: u32, reg: u32, idx: u32, mask: u8| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: idx,
+        system_value: sv,
+        component_type: ty,
+        register: reg,
+        mask,
+        rw_mask: mask,
+        stream: 0,
+    };
+    // 1. Standard interface
+    let ms = MsInterface {
+        outputs: vec![sig("SV_Position", 1, 3, 0, 0, 0xF), sig("TEXCOORD", 0, 3, 1, 0, 0xF), sig("TEXCOORD", 0, 1, 2, 1, 0xF)],
+        threads: 128,
+        max_vertices: 128,
+        max_primitives: 128,
+    };
+    let std_src = vertex_passthrough(&ms);
+    assert!(std_src.contains("uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu)"), "{std_src}");
+    dxc::compile(&std_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("standard vs_6_6: {e}\n{std_src}"));
+
+    // 2. PS-filtered interface (including missing PS input defaulted to 0 and clip/cull distances)
+    let ms_clip = MsInterface {
+        outputs: vec![
+            sig("SV_Position", 1, 3, 0, 0, 0xF),
+            sig("TEXCOORD", 0, 3, 1, 0, 0xF),
+            sig("SV_ClipDistance", 2, 3, 2, 0, 0x3),
+            sig("SV_CullDistance", 3, 3, 3, 0, 0x1),
+        ],
+        threads: 128,
+        max_vertices: 128,
+        max_primitives: 128,
+    };
+    let ps_ins = vec![sig("TEXCOORD", 0, 3, 0, 0, 0xF), sig("TEXCOORD", 0, 2, 1, 5, 0xF)];
+    let clip_src = vertex_passthrough_for(&ms_clip, Some(&ps_ins));
+    assert!(clip_src.contains("SV_ClipDistance0") && clip_src.contains("SV_CullDistance0"), "{clip_src}");
+    assert!(clip_src.contains("asint(uint4(0u, 0u, 0u, 0u).xyzw)"), "{clip_src}");
+    dxc::compile(&clip_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("clip/filtered vs_6_6: {e}\n{clip_src}"));
+
+    // 3. >32 KB split-case interface (21 float4 params + clip distance, 128 vertices): compiles cleanly with no splitting
+    let mut big_outs = vec![sig("SV_Position", 1, 3, 0, 0, 0xF)];
+    for k in 0..21u32 {
+        big_outs.push(sig("TEXCOORD", 0, 3, k + 1, k, 0xF));
+    }
+    big_outs.push(sig("SV_ClipDistance", 2, 3, 22, 0, 0x1));
+    let ms_big = MsInterface { outputs: big_outs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let big_src = vertex_passthrough(&ms_big);
+    dxc::compile(&big_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("big vs_6_6: {e}\n{big_src}"));
+
+    // 4. max_primitives == 0: safe early return with NaN, compiles cleanly
+    let ms_zero = MsInterface { outputs: vec![sig("SV_Position", 1, 3, 0, 0, 0xF)], threads: 64, max_vertices: 0, max_primitives: 0 };
+    let zero_src = vertex_passthrough(&ms_zero);
+    assert!(zero_src.contains("asfloat(0x7fc00000u).xxxx") && !zero_src.contains("vid / 3u"), "{zero_src}");
+    dxc::compile(&zero_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("zero-mp vs_6_6: {e}\n{zero_src}"));
+}
+
+#[test]
+fn gpu_ngg_mesh_via_vertex_passthrough() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, emit::vertex_passthrough_for, vertex_passthrough, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None),
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)),
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 20), ("SRC0", 1)], None),
+        ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 10), ("SRC0", V + 20), ("VSRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 14), ("SRC0", V + 20)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [14, 15, 16, 17], 0));
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None));
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let opt = on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() });
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let vs_src = vertex_passthrough(&ms);
+    let vsb = dxc::compile(&vs_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs_src}"));
+    let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let mut mem = vec![0u32; 256];
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    let (px, rec) = runner::mesh_draw_vs(&cs, &vsb, &ps, 2, ms.max_primitives, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    for g in 0..2usize {
+        let r = &rec[g * rd..(g + 1) * rd];
+        assert_eq!((r[0], r[1]), (3, 1), "group {g}: GS_ALLOC_REQ counts");
+        assert_eq!(r[MESH_HEADER + 128 * vd], 1 << 10 | 2 << 20, "group {g} primitive");
+    }
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    assert_eq!((at(3, 29)[0], at(3, 29)[3]), (0.0, 1.0), "group 0 triangle (left)");
+    assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "group 1 triangle (right)");
+    assert_eq!(at(29, 3), [-1.0; 4], "outside both triangles");
+
+    // 16-input PS (>32 KB mesh output limit): VS pass-through handles it in a single unsplit draw
+    let ins: Vec<crate::gpu::dxbc::SigElement> = (0..16).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
+    let vs16_src = vertex_passthrough_for(&ms, Some(&ins));
+    let vsb16 = dxc::compile(&vs16_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs16_src}"));
+    let fields: String = (0..16).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
+    let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
+    let (px16, _) = runner::mesh_draw_vs(&cs, &vsb16, &ps16, 2, ms.max_primitives, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert_eq!(px16, px, "16-input VS pass-through draws identical pixels");
+}
+
+#[test]
+fn gpu_vertex_passthrough_discards_null_oob_and_excess_primitives() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, vertex_passthrough, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 32, max_vertices: 8, max_primitives: 6 };
+    let vd = ms.vert_dwords();
+    let rd = ms.record_dwords();
+    let tri_base = MESH_HEADER + ms.max_vertices as usize * vd;
+    // Compute shader writes two groups:
+    // Group 0: nv=6, np=3:
+    //   prim 0: valid triangle covering bottom-left (-1,-1),(-1,0),(0,-1) with red=(1,0,0,1)
+    //   prim 1: null_prim (bit 31 set) covering top-right (0,0),(0,1),(1,1) -> MUST be discarded!
+    //   prim 2: out-of-range vertex index (vidx=6 >= nv=6) -> MUST be discarded!
+    //   prim 3..5: j >= np -> MUST be discarded!
+    // Group 1 (iid=1): nv=3, np=1:
+    //   prim 0: valid triangle covering bottom-right (0,-1),(0,0),(1,-1) with interpolated color
+    let cs_src = format!(
+        r#"
+RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer res : register(u1);
+void write_v(uint rec, uint idx, float4 pos, float4 col) {{
+    uint b = (rec + {MESH_HEADER}u + idx * {vd}u) * 4u;
+    res.Store4(b, asuint(pos));
+    res.Store4(b + 16u, asuint(col));
+}}
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {{
+    uint rec = gid.x * {rd}u;
+    if (gid.x == 0u) {{
+        res.Store2(rec * 4u, uint2(6u, 3u));
+        write_v(rec, 0u, float4(-1.0, -1.0, 0.0, 1.0), float4(1.0, 0.0, 0.0, 1.0));
+        write_v(rec, 1u, float4(-1.0,  0.0, 0.0, 1.0), float4(1.0, 0.0, 0.0, 1.0));
+        write_v(rec, 2u, float4( 0.0, -1.0, 0.0, 1.0), float4(1.0, 0.0, 0.0, 1.0));
+        write_v(rec, 3u, float4( 0.0,  0.0, 0.0, 1.0), float4(0.0, 1.0, 0.0, 1.0));
+        write_v(rec, 4u, float4( 0.0,  1.0, 0.0, 1.0), float4(0.0, 1.0, 0.0, 1.0));
+        write_v(rec, 5u, float4( 1.0,  1.0, 0.0, 1.0), float4(0.0, 1.0, 0.0, 1.0));
+        // prim 0: valid (0, 1, 2) with edge flags set at bits 9, 19, 29 to test masking
+        res.Store((rec + {tri_base}u + 0u) * 4u, 0u | (1u << 9) | (1u << 10) | (1u << 19) | (2u << 20) | (1u << 29));
+        // prim 1: null_prim (bit 31) with verts (3, 4, 5)
+        res.Store((rec + {tri_base}u + 1u) * 4u, (1u << 31) | 3u | (4u << 10) | (5u << 20));
+        // prim 2: out-of-range vertex index 6 >= nv(6)
+        res.Store((rec + {tri_base}u + 2u) * 4u, 3u | (4u << 10) | (6u << 20));
+        // prim 3: beyond np (j=3 >= np=3), valid indices (3, 4, 5) must still be ignored
+        res.Store((rec + {tri_base}u + 3u) * 4u, 3u | (4u << 10) | (5u << 20));
+    }} else {{
+        res.Store2(rec * 4u, uint2(3u, 1u));
+        write_v(rec, 0u, float4(0.0, -1.0, 0.0, 1.0), float4(0.0, 0.0, 1.0, 1.0));
+        write_v(rec, 1u, float4(0.0,  0.0, 0.0, 1.0), float4(0.0, 1.0, 1.0, 1.0));
+        write_v(rec, 2u, float4(1.0, -1.0, 0.0, 1.0), float4(1.0, 0.0, 1.0, 1.0));
+        res.Store((rec + {tri_base}u + 0u) * 4u, 0u | (1u << 10) | (2u << 20));
+    }}
+}}
+"#
+    );
+    let cs = dxc::compile(&cs_src, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{cs_src}"));
+    let vs = dxc::compile(&vertex_passthrough(&ms), "main", "vs_6_6", &[]).unwrap();
+    let ps = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let clear = [-2.0f32; 4];
+    let (px, _) = runner::mesh_draw_vs(&cs, &vs, &ps, 2, ms.max_primitives, rd, &[], &[], 32, clear).unwrap();
+    let at = |x: usize, y: usize| px[y * 32 + x];
+    // Bottom-left (group 0 prim 0): exact red
+    assert_eq!(at(3, 29), [1.0, 0.0, 0.0, 1.0], "group 0 valid triangle");
+    // Top-right (would be covered by prim 1 null_prim / prim 2 oob / prim 3 j>=np): exact clear
+    assert_eq!(at(20, 6), clear, "null_prim / oob / j>=np must be discarded");
+    // Top-left: exact clear
+    assert_eq!(at(6, 6), clear, "uncovered top-left must stay clear");
+    // Bottom-right (group 1 prim 0): interpolated blue/cyan/magenta with alpha=1 and B=1
+    let br = at(19, 29);
+    assert_eq!(br[2], 1.0, "group 1 B channel");
+    assert_eq!(br[3], 1.0, "group 1 A channel");
+    assert!(br[0] > 0.0 && br[0] < 1.0 && br[1] > 0.0 && br[1] < 1.0, "group 1 interpolated RG: {br:?}");
+}
+
+#[test]
+fn gpu_geometry_es_gs_via_vertex_passthrough() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, vertex_passthrough, IO_GS_PRIMS, IO_GS_VERTICES};
+    for branches in [false, true] {
+        let (code, g) = geometry_es_gs_program(branches);
+        let opt = on_gpu(Options { mode: Mode::Geometry(g.clone()), wave64: true, ..Default::default() });
+        let t = translate(&code, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let rec = g.record();
+        let vsb = dxc::compile(&vertex_passthrough(&rec), "main", "vs_6_6", &[]).unwrap();
+        let ps_src = "struct V { float4 pos : SV_Position; nointerpolation uint4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return float4(1.0, (float)v.p0.y, 0.0, 1.0); }\n";
+        let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+        let total = 25usize;
+        let vtx = |p: usize, i: usize| [p as f32 * 0.03 - 0.6 + i as f32 * 0.2, p as f32 * 0.02 - 0.5 + (i == 2) as u32 as f32 * 0.25, 0.5, 1.0];
+        let mut mem = vec![0u32; 0x1000 / 4 + total * 3 * 4];
+        for p in 0..total {
+            for i in 0..3 {
+                let at = 0x1000 / 4 + (p * 3 + i) * 4;
+                mem[at..at + 4].copy_from_slice(&vtx(p, i).map(f32::to_bits));
+            }
+        }
+        let mut io = vec![0u32; 128];
+        io[IO_GS_PRIMS] = total as u32;
+        io[IO_GS_VERTICES] = 0x1000;
+        let (px, recs) = runner::mesh_draw_vs(&cs, &vsb, &ps, 2, rec.max_primitives, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
+        let rd = rec.record_dwords();
+        assert_eq!((recs[0], recs[1]), (4 * 21, 2 * 21), "branches={branches} group 0 counts");
+        assert_eq!((recs[rd], recs[rd + 1]), (4 * 4, 2 * 4), "branches={branches} group 1 counts");
+        let lit = px.iter().filter(|p| p[0] == 1.0 && p[3] == 1.0).count();
+        assert!(lit > 40, "branches={branches}: expected rasterised GS quads via VS pass-through, got {lit} lit pixels");
+    }
+}
+
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
 /// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
 /// 32768) and the record must go out in split groups. A retail title's NGG transform programs

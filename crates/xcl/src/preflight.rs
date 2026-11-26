@@ -68,7 +68,11 @@ pub fn checks(f: &Found) -> Vec<Check> {
                 v.push(check(Level::Error, format!("{} (has {}.{}): shaders cannot run", g.no_sm66, g.shader_model.0, g.shader_model.1), Some("update the GPU driver; on Windows 10, put the D3D12 Agility SDK's D3D12Core.dll in a D3D12 folder next to xcl.exe")));
             }
             if !g.mesh {
-                v.push(check(Level::Warning, "no mesh shaders: the game's geometry and NGG programs are not drawn", Some("a GPU with D3D12 mesh shaders is needed (NVIDIA RTX 20 / GTX 16 or newer, AMD RX 6000 or newer, Intel Arc)")));
+                v.push(check(
+                    Level::Note,
+                    "no hardware mesh shaders: geometry and NGG programs run via the vertex shader pass-through fallback",
+                    Some("a GPU with D3D12 mesh shaders runs them natively (NVIDIA RTX 20 / GTX 16 or newer, AMD RX 6000 or newer, Intel Arc)"),
+                ));
             }
             let wave64 = g.wave_min <= 64 && g.wave_max >= 64;
             let wave32 = g.wave_min <= 32 && g.wave_max >= 32;
@@ -213,7 +217,7 @@ mod tests {
         f.dxc = Err("dxcompiler.dll not found".into());
         f.xgameruntime = false;
         let c = checks(&f);
-        assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Warning, Level::Error, Level::Warning]);
+        assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Note, Level::Error, Level::Warning]);
         assert!(c[1].what.contains("has 6.5"), "{:?}", c[1]);
         // XCL's own task queues and networking stand in for the PC runtime's: not missing
         let missing = c[4].what.split(" missing").next().unwrap();

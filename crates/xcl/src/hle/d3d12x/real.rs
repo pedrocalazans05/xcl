@@ -479,6 +479,26 @@ fn conservative_raster(device: *mut c_void) -> bool {
     }
 }
 
+static MESH_SHADERS: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+
+/// Whether `device` supports hardware D3D12 mesh shaders (and `XCL_MESH_EMULATION=1` is not set).
+/// Cached per device pointer. Unknown/null device: false (safe VS pass-through fallback).
+pub(super) fn has_mesh_shaders(device: *mut c_void) -> bool {
+    if crate::gpu::recomp::pso::mesh_emulation_forced() || device.is_null() {
+        return false;
+    }
+    let key = device as usize;
+    if let Some(&cached) = MESH_SHADERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return cached;
+    }
+    let supported = unsafe {
+        ID3D12Device::from_raw_borrowed(&device)
+            .is_some_and(crate::gpu::recomp::pso::device_has_mesh_shaders)
+    };
+    MESH_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
+    supported
+}
+
 /// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
@@ -806,6 +826,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + x] = pc[1 + p];
         }
     }
+    let pre_console_127 = if kind == Kind::CommandList && 127 < total { v[1 + 127] } else { 0 };
     // slots where the console's method differs from the PC one at the same index
     for (slot, f) in console_slots(kind) {
         if slot < public {
@@ -830,13 +851,21 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // methods the newer console layout keeps at other slots: picked at each call
     if kind == Kind::CommandList {
         let older_handlers = console_slots(kind);
-        for (newer, older) in NEWER_LIST_SLOTS {
-            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
-            if newer >= total {
+        for slot in NEWER_LIST_SLOTS.iter().map(|&(newer, _)| newer).chain(std::iter::once(OLDER_DISPATCH_MESH_SLOT)) {
+            if slot >= total {
                 continue;
             }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
-            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+            let Some((older, newer)) = command_list_layout_targets(slot, v[1 + slot], pre_console_127, &older_handlers) else {
+                continue;
+            };
+            let pc = if slot < scanned {
+                *ot.add(slot)
+            } else if slot == OLDER_DISPATCH_MESH_SLOT {
+                pre_console_127
+            } else {
+                v[1 + slot]
+            };
+            v[1 + slot] = super::guard::make_layout_split(super::guard::LayoutTargets { older, newer, pc, newer_layout: &QUEUE_SHIFTED });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -1051,6 +1080,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (90, l::write32_bottom_of_shader_x as usize),
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
+                (OLDER_DISPATCH_MESH_SLOT, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
@@ -5579,7 +5609,7 @@ unsafe fn standin_compute(this: *mut c_void, f: PsoFn, desc: *const c_void, riid
 }
 
 unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let Some((buf, _)) = fallback_stream(desc as *const u8) else { return E_INVALIDARG };
+    let Some((buf, _)) = fallback_stream(desc as *const u8, has_mesh_shaders(this), conservative_raster(this)) else { return E_INVALIDARG };
     let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
     finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
 }
@@ -5617,7 +5647,7 @@ unsafe fn compute_key(this: *mut c_void, desc: *const c_void) -> Option<super::s
 /// `graphics_key` of a pipeline stream: its subobjects with the stand-in's shaders in place of
 /// the title's, but the state a stand-in does not need.
 unsafe fn stream_key(this: *mut c_void, desc: *const c_void) -> Option<super::standin::Key> {
-    let (buf, _) = fallback_stream(desc as *const u8)?;
+    let (buf, _) = fallback_stream(desc as *const u8, has_mesh_shaders(this), conservative_raster(this))?;
     let (mut state, mut root_signature) = (Vec::new(), 0usize);
     for (ty, p) in stream_subobjects(&buf)? {
         match ty {
@@ -5812,19 +5842,22 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
 // ---------------------------------------------------------------------------------------
 
 /// What XCL keeps for a mesh pipeline built from console MS / GS code: the title holds the
-/// mesh pipeline state (pass-through MS + PS); the draw first runs `compute` (the console
-/// program, one record per thread group into `res`), then the mesh pipeline over the records.
+/// mesh (or VS fallback) pipeline state (pass-through MS/VS + PS); the draw first runs
+/// `compute` (the console program, one record per thread group into `res`), then the
+/// pass-through pipeline over the records.
 pub struct TwoPassPso {
     /// compute pipeline state, owned here, and its root signature (static samplers)
     pub compute: usize,
     pub compute_rs: usize,
-    /// root signature of the mesh pipeline (the title's PSO; its PS's static samplers)
+    /// root signature of the mesh/VS pipeline (the title's PSO; its PS's static samplers)
     pub mesh_rs: usize,
     pub record: crate::gpu::recomp::MsInterface,
-    /// DispatchMesh groups per record (see `pso::TwoPass`)
+    /// DispatchMesh groups per record (see `pso::TwoPass`; always 1 when `uses_vs`)
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+    /// true when the second pass is a `vs_6_6` vertex-shader fallback (`DrawInstanced`)
+    pub uses_vs: bool,
 }
 
 impl Drop for TwoPassPso {
@@ -5860,16 +5893,30 @@ pub fn driver_cache_stats() -> (u64, u64, u64) {
 
 #[cfg(test)]
 pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
+    register_two_pass_full_for_test(pso, 0, 0, 0, kind, false, 64);
+}
+
+#[cfg(test)]
+pub(super) fn register_two_pass_full_for_test(
+    pso: usize,
+    compute: usize,
+    compute_rs: usize,
+    mesh_rs: usize,
+    kind: &'static str,
+    uses_vs: bool,
+    max_primitives: u32,
+) {
     if pso != 0 {
         TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
             pso,
             std::sync::Arc::new(TwoPassPso {
-                compute: 0,
-                compute_rs: 0,
-                mesh_rs: 0,
-                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
+                compute,
+                compute_rs,
+                mesh_rs,
+                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives },
                 mesh_groups_per_record: 1,
                 kind,
+                uses_vs,
             }),
         );
     }
@@ -5960,11 +6007,16 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     shader_bytes(&b)
 }
 
-/// The passthrough mesh shader emits triangles for both translated MS and GS pipelines.
-fn two_pass_mesh_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>) -> StreamOut {
+/// The passthrough mesh or vertex shader emits triangles for both translated MS and GS pipelines.
+fn two_pass_mesh_stream(rs: *mut c_void, shader: &[u8], ps: Option<&[u8]>, uses_vs: bool) -> StreamOut {
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    let ty = if uses_vs {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS
+    } else {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS
+    };
+    out.shader(ty, shader);
     if let Some(ps) = ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
     }
@@ -6013,7 +6065,7 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
         reference.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
         reference.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
         let blob = build(&reference).GetCachedBlob().unwrap();
-        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None);
+        let mut translated = two_pass_mesh_stream(rs.as_raw(), ms, None, false);
         let subobjects = stream_subobjects(&translated.0).unwrap();
         let topology = subobjects.iter().find(|(kind, _)| *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32);
         assert_eq!(topology.map(|(_, payload)| *payload), Some(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice()));
@@ -6202,10 +6254,12 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mesh_pso = mesh_pso.into_raw();
     *ppv = mesh_pso;
     note_pso_rs(mesh_pso, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    let uses_vs = tp.uses_vs;
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind, uses_vs }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+        let pass_kind = if uses_vs { "VS" } else { "mesh" };
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + {pass_kind} {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr
 }
@@ -6217,7 +6271,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 }
 
 unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_mesh, is_console};
+    use crate::gpu::recomp::pso::{console_mesh_with_mode, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
     }
@@ -6257,7 +6311,8 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let console_ps = ps;
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
+    let use_vs = !has_mesh_shaders(this);
+    let (tp, (ps, ps_samplers)) = match (console_mesh_with_mode(ms, ps, wave32_only(this), use_vs), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -6270,7 +6325,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref(), tp.uses_vs);
     // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
     // integer RTVs regardless of subobject order in the stream.
     let mut rt_count = 0u32;
@@ -6282,8 +6337,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
         rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
     }
+    let allow_cr = conservative_raster(this);
     for (ty, payload) in &subs {
-        let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
+        let skip = [0, 1, 2, 3, 4, 5, 7, 12, 14, 19, 24, 25].contains(ty); // RS, shaders, SO, IL, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // BLEND: clear BlendEnable / LogicOpEnable on integer render targets (PC D3D12 rejects them)
@@ -6291,6 +6347,9 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
                 let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
                 sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
                 out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
+                continue;
+            }
+            if matches!(*ty, 10 | 27 | 28) && emit_sanitized_rasterizer(&mut out, *ty, payload, allow_cr) {
                 continue;
             }
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -6317,11 +6376,12 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     Some(hr)
 }
 
-/// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
-/// with the description's state.
+/// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh (or VS
+/// fallback) pipeline with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let use_vs = !has_mesh_shaders(this);
     let (tp, (ps, ps_samplers)) = match (
-        crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
+        crate::gpu::recomp::pso::console_geometry_with_mode(vs, gs, shader_bytes(&d.PS), wave32_only(this), use_vs),
         two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
@@ -6366,7 +6426,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref(), tp.uses_vs);
     let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats };
     for f in rt.RTFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
@@ -6376,7 +6436,11 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     sanitize_integer_rt_blend(&mut blend, rt.NumRenderTargets, &rt.RTFormats);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
+    let mut rast = d.RasterizerState;
+    if !conservative_raster(this) {
+        rast.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &rast);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv);
@@ -6392,8 +6456,40 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     hr
 }
 
+/// Emit a rasterizer subobject (types 10, 27, 28) into `out`, clearing `ConservativeRaster`
+/// when `!allow_cr` (e.g. AMD Polaris / RX 580). Returns `true` if `ty` was handled.
+unsafe fn emit_sanitized_rasterizer(out: &mut StreamOut, ty: u32, payload: &[u8], allow_cr: bool) -> bool {
+    if allow_cr {
+        return false;
+    }
+    match ty {
+        10 if payload.len() >= std::mem::size_of::<D3D12_RASTERIZER_DESC>() => {
+            let mut r: D3D12_RASTERIZER_DESC = std::ptr::read_unaligned(payload.as_ptr().cast());
+            r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &r);
+            true
+        }
+        27 if payload.len() >= std::mem::size_of::<D3D12_RASTERIZER_DESC1>() => {
+            let mut r: D3D12_RASTERIZER_DESC1 = std::ptr::read_unaligned(payload.as_ptr().cast());
+            r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1, &r);
+            true
+        }
+        28 if payload.len() >= std::mem::size_of::<D3D12_RASTERIZER_DESC2>() => {
+            let mut r: D3D12_RASTERIZER_DESC2 = std::ptr::read_unaligned(payload.as_ptr().cast());
+            r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, &r);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
-unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
+/// When `mesh_shaders` is false and the stream has an MS subobject (type 25), rewrites it to a
+/// VS graphics stream (type 1 with `&d.vs`, type 2 with `&d.ps`, drops AS type 24, and ensures
+/// `PRIMITIVE_TOPOLOGY = TRIANGLE`) so stand-in/async mesh PSOs succeed on non-MS GPUs (RX 580).
+unsafe fn fallback_stream(desc: *const u8, mesh_shaders: bool, allow_cr: bool) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
     let base = *(desc.add(8) as *const usize);
     if !crate::gpu::shader::readable(base, size) {
@@ -6417,6 +6513,66 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         }
         (mesh, rt_count, rt_formats)
     };
+    if mesh && !mesh_shaders {
+        let mut out = StreamOut::default();
+        let mut saw_topology = false;
+        let mut emitted_vs = false;
+        let mut off = 0usize;
+        while off + 8 <= size {
+            let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+            let (psize, palign) = super::null::subobject_payload(ty)?;
+            let poff = if palign == 8 { 8 } else { 4 };
+            let at = off + poff;
+            if at.checked_add(psize)? > size {
+                return None;
+            }
+            match ty {
+                24 => {} // drop AS so D3D12 does not reject mixing AS with VS
+                1 | 25 => {
+                    if !emitted_vs {
+                        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &d.vs);
+                        emitted_vs = true;
+                    }
+                }
+                2 => out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &d.ps),
+                6 => out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, &d.cs),
+                3 | 4 | 5 => out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(ty as i32), &D3D12_SHADER_BYTECODE::default()),
+                14 => {
+                    saw_topology = true;
+                    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+                }
+                8 if psize >= std::mem::size_of::<D3D12_BLEND_DESC>() => {
+                    let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(buf[at..].as_ptr() as *const D3D12_BLEND_DESC);
+                    sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+                    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
+                }
+                10 | 27 | 28 if emit_sanitized_rasterizer(&mut out, ty, &buf[at..at + psize], allow_cr) => {}
+                15 if psize >= 32 => {
+                    let mut p = buf[at..at + psize].to_vec();
+                    for k in 0..8 {
+                        let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                        p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                    }
+                    out.raw(ty, &p, palign == 8);
+                }
+                16 if psize >= 4 => {
+                    let mut p = buf[at..at + psize].to_vec();
+                    let f = super::device_x::pc_view_format(u32::from_le_bytes(p[0..4].try_into().unwrap()));
+                    p[0..4].copy_from_slice(&f.to_le_bytes());
+                    out.raw(ty, &p, palign == 8);
+                }
+                12 | 19 => out.raw(ty, &[0u8; 16], palign == 8),
+                7 => out.raw(ty, &[0u8; 32], palign == 8),
+                _ => out.raw(ty, &buf[at..at + psize], palign == 8),
+            }
+            off += (poff + psize + 7) & !7;
+        }
+        if !saw_topology {
+            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        }
+        let len = out.0.len();
+        return Some((out.0, [len, 0]));
+    }
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -6444,6 +6600,24 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
                 let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(buf[at..].as_ptr() as *const D3D12_BLEND_DESC);
                 sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
                 let bytes = std::slice::from_raw_parts(&blend as *const D3D12_BLEND_DESC as *const u8, std::mem::size_of::<D3D12_BLEND_DESC>());
+                buf[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+            10 if !allow_cr && psize >= std::mem::size_of::<D3D12_RASTERIZER_DESC>() => {
+                let mut r: D3D12_RASTERIZER_DESC = std::ptr::read_unaligned(buf[at..].as_ptr().cast());
+                r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+                let bytes = std::slice::from_raw_parts(&r as *const _ as *const u8, std::mem::size_of::<D3D12_RASTERIZER_DESC>());
+                buf[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+            27 if !allow_cr && psize >= std::mem::size_of::<D3D12_RASTERIZER_DESC1>() => {
+                let mut r: D3D12_RASTERIZER_DESC1 = std::ptr::read_unaligned(buf[at..].as_ptr().cast());
+                r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+                let bytes = std::slice::from_raw_parts(&r as *const _ as *const u8, std::mem::size_of::<D3D12_RASTERIZER_DESC1>());
+                buf[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+            28 if !allow_cr && psize >= std::mem::size_of::<D3D12_RASTERIZER_DESC2>() => {
+                let mut r: D3D12_RASTERIZER_DESC2 = std::ptr::read_unaligned(buf[at..].as_ptr().cast());
+                r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+                let bytes = std::slice::from_raw_parts(&r as *const _ as *const u8, std::mem::size_of::<D3D12_RASTERIZER_DESC2>());
                 buf[at..at + bytes.len()].copy_from_slice(bytes);
             }
             15 if psize >= 32 => {
@@ -6983,7 +7157,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, 16) {
         return hr;
     }
-    let Some((buf, _)) = fallback_stream(desc as *const u8) else {
+    let Some((buf, _)) = fallback_stream(desc as *const u8, has_mesh_shaders(this), conservative_raster(this)) else {
         note_fallback("PSO stream", hr, false);
         return hr;
     };
@@ -7253,10 +7427,26 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 /// (on the newer layout those slots are other methods)
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
+/// Older-layout command list slot for `DispatchMesh` (shifts to #129 on the newer layout, where
+/// #126 is `RSSetShadingRate` and #127 is `RSSetShadingRateImage`).
+const OLDER_DISPATCH_MESH_SLOT: usize = 127;
+
 /// command list slots of the newer layout → the older layout's slot of the same method
 /// (`DispatchMesh` sits at newer #129 after #126 RSSetShadingRate, #127 RSSetShadingRateImage,
 /// and #128 Scarlett-only shading-rate/color struct; older #127, two slots before as the others).
 const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
+
+/// Resolve `(older, newer)` console targets for a command-list slot that depends on
+/// `QUEUE_SHIFTED`, or `None` if the slot is layout-independent.
+fn command_list_layout_targets(slot: usize, current: usize, pre_console_127: usize, older_handlers: &[(usize, usize)]) -> Option<(usize, usize)> {
+    if slot == OLDER_DISPATCH_MESH_SLOT {
+        let older = older_handlers.iter().find(|e| e.0 == slot)?.1;
+        return Some((older, pre_console_127));
+    }
+    let &(_, older_slot) = NEWER_LIST_SLOTS.iter().find(|&&(newer, _)| newer == slot)?;
+    let newer = older_handlers.iter().find(|e| e.0 == older_slot)?.1;
+    Some((current, newer))
+}
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -7791,11 +7981,119 @@ mod fallback_stream_tests {
         let stream = [vs, 0x1234, 0x10];
         unsafe {
             let cut: [usize; 2] = [16, stream.as_ptr() as usize];
-            assert!(fallback_stream(cut.as_ptr() as *const u8).is_none());
+            assert!(fallback_stream(cut.as_ptr() as *const u8, true, true).is_none());
             let whole: [usize; 2] = [24, stream.as_ptr() as usize];
-            let (buf, size) = fallback_stream(whole.as_ptr() as *const u8).expect("a whole VS subobject");
+            let (buf, size) = fallback_stream(whole.as_ptr() as *const u8, true, true).expect("a whole VS subobject");
             assert_eq!((buf.len(), size), (24, [24, 0]));
             assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), dummy().vs.len() as u64);
+        }
+    }
+
+    #[test]
+    fn fallback_stream_rewrites_ms_and_as_to_vs_when_no_mesh_shaders() {
+        let fake_as = [1u8; 8];
+        let fake_ms = [2u8; 8];
+        let fake_ps = [3u8; 8];
+        let rast_cr = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+            ..Default::default()
+        };
+        let mut s = StreamOut::default();
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, &fake_as);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &fake_ms);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &fake_ps);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &rast_cr);
+        let desc: [usize; 2] = [s.0.len(), s.0.as_ptr() as usize];
+        let (buf, out_desc) = unsafe { fallback_stream(desc.as_ptr() as *const u8, false, false) }.expect("rewritten stream");
+        assert_eq!(out_desc, [buf.len(), 0]);
+        let subs = stream_subobjects(&buf).expect("valid stream");
+        assert!(!subs.iter().any(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32), "AS must be dropped");
+        assert!(!subs.iter().any(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32), "MS must be replaced");
+        let vs = subs.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS.0 as u32).expect("VS present");
+        assert_eq!(u64::from_le_bytes(vs.1[8..16].try_into().unwrap()), dummy().vs.len() as u64);
+        let ps = subs.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).expect("PS present");
+        assert_eq!(u64::from_le_bytes(ps.1[8..16].try_into().unwrap()), dummy().ps.len() as u64);
+        let topo = subs.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32).expect("topology present");
+        assert_eq!(topo.1, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0.to_le_bytes().as_slice());
+        let rast_sub = subs.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER.0 as u32).expect("rasterizer present");
+        let got_rast: D3D12_RASTERIZER_DESC = unsafe { std::ptr::read_unaligned(rast_sub.1.as_ptr().cast()) };
+        assert_eq!(got_rast.ConservativeRaster, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF, "CR must be stripped when !allow_cr");
+    }
+
+    #[test]
+    fn passthrough_vs_stream_and_fallback_stream_create_psos_on_gpu() {
+        use crate::gpu::recomp::{dxc, runner, vertex_passthrough, MsInterface};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        if dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                return runner::skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            let dev2: ID3D12Device2 = dev.cast().expect("ID3D12Device2");
+            let abi_rs = crate::gpu::recomp::pso::abi_root_signature(&dev, true).expect("ABI RS");
+            let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+                name: name.into(),
+                index: 0,
+                system_value: sv,
+                component_type: 3,
+                register: reg,
+                mask: 0xF,
+                rw_mask: 0xF,
+                stream: 0,
+            };
+            let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 64, max_vertices: 64, max_primitives: 32 };
+            let vs_dxil = dxc::compile(&vertex_passthrough(&ms), "main", "vs_6_6", &[]).expect("compile vertex_passthrough");
+            let ps_dxil = dxc::compile("struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n", "main", "ps_6_6", &[]).expect("compile ps");
+
+            // 1. two_pass_mesh_stream(..., uses_vs = true) creates a valid graphics PSO on RX 580
+            let mut rtv = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+            rtv.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let mut stream = two_pass_mesh_stream(abi_rs.as_raw(), &vs_dxil, Some(&ps_dxil), true);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rtv);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+            let pso: ID3D12PipelineState = dev2
+                .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: stream.0.len(),
+                    pPipelineStateSubobjectStream: stream.0.as_ptr() as *mut c_void,
+                })
+                .expect("two_pass_mesh_stream(uses_vs=true) PSO creation must succeed");
+            let _ = pso.GetCachedBlob();
+
+            // 2. fallback_stream(..., false, allow_cr) on an MS+AS+PS+CR stream creates a valid stand-in PSO on RX 580
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            let empty_rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap();
+            let fake = [0xAAu8; 16];
+            let rast_cr = D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+                ..Default::default()
+            };
+            let mut ms_stream = StreamOut::default();
+            ms_stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &empty_rs.as_raw());
+            ms_stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, &fake);
+            ms_stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &fake);
+            ms_stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &fake);
+            ms_stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &rast_cr);
+            ms_stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rtv);
+            ms_stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+            let desc: [usize; 2] = [ms_stream.0.len(), ms_stream.0.as_ptr() as usize];
+            let (rewritten, _) = fallback_stream(desc.as_ptr() as *const u8, false, conservative_raster(dev.as_raw())).expect("fallback_stream(false)");
+            let _standin: ID3D12PipelineState = dev2
+                .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: rewritten.len(),
+                    pPipelineStateSubobjectStream: rewritten.as_ptr() as *mut c_void,
+                })
+                .expect("fallback_stream(false) stand-in PSO creation must succeed on non-MS/non-CR GPU");
         }
     }
 }
@@ -8174,6 +8472,40 @@ mod queue_tests {
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
         assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
+    }
+
+    #[test]
+    fn dispatch_mesh_slot_routing_respects_console_layout() {
+        let handlers = console_slots(Kind::CommandList);
+        let dm = super::super::bind::dispatch_mesh as usize;
+        assert!(
+            !handlers.iter().any(|&(slot, _)| slot == 126),
+            "slot #126 (RSSetShadingRate on newer layout) must not be hooked as DispatchMesh"
+        );
+        assert!(
+            handlers.contains(&(127, dm)),
+            "older-layout DispatchMesh must be registered at slot #127"
+        );
+
+        let stub_126 = 0x1000_0126usize;
+        let stub_127 = 0x1000_0127usize;
+        let stub_129 = 0x1000_0129usize;
+
+        assert_eq!(
+            command_list_layout_targets(126, stub_126, stub_127, &handlers),
+            None,
+            "slot #126 must stay on its default stub/guard under both layouts"
+        );
+        assert_eq!(
+            command_list_layout_targets(127, dm, stub_127, &handlers),
+            Some((dm, stub_127)),
+            "slot #127 routes to dispatch_mesh only when !QUEUE_SHIFTED and falls back to stub when QUEUE_SHIFTED"
+        );
+        assert_eq!(
+            command_list_layout_targets(129, stub_129, stub_127, &handlers),
+            Some((stub_129, dm)),
+            "slot #129 routes to dispatch_mesh only when QUEUE_SHIFTED"
+        );
     }
 }
 
@@ -8699,6 +9031,7 @@ mod mesh_stream_tests {
             record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
+            uses_vs: false,
         };
         let stream = StreamOut::default();
         let iid = pc_iid(Kind::PipelineState);

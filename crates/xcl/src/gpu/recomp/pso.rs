@@ -1057,34 +1057,43 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
 /// shader writes one record per thread group (vertices + primitives, `record`) into `res`,
-/// then a pass-through mesh shader rasterises the records with the pixel shader.
+/// then a pass-through mesh shader (or vertex shader when `uses_vs` is true) rasterises the
+/// records with the pixel shader.
 pub struct TwoPass {
     /// compute pass (cs_6_6 DXIL)
     pub cs: Vec<u8>,
-    /// pass-through mesh shader (ms_6_6 DXIL)
+    /// pass-through shader (ms_6_6 DXIL when `!uses_vs`, vs_6_6 DXIL when `uses_vs`)
     pub ms: Vec<u8>,
     pub record: super::MsInterface,
     /// mesh groups of the pass-through per record (> 1: the record is over D3D12's mesh
-    /// output limit and goes out in runs of triangles)
+    /// output limit and goes out in runs of triangles; always 1 when `uses_vs`)
     pub mesh_groups_per_record: u32,
     /// static samplers of the compute pass
     pub samplers: Vec<StaticSampler>,
+    /// true when `ms` is a `vs_6_6` vertex-shader pass-through fallback
+    pub uses_vs: bool,
 }
 
-fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>, use_vs: bool) -> Result<TwoPass, String> {
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
+    let (ms, mesh_groups_per_record) = if use_vs {
+        let vs = dxc::compile_cached(&super::emit::vertex_passthrough_for(&record, ps_inputs.as_deref()), "main", "vs_6_6")?.0;
+        (vs, 1)
+    } else {
+        let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+        let split = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+        (ms, split)
+    };
+    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers, uses_vs: use_vs })
 }
 
-fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>, use_vs: bool) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
+    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps, use_vs)
 }
 
 fn compile_console_mesh(
@@ -1124,10 +1133,12 @@ fn compile_console_mesh(
     Ok(Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn console_mesh_with(
     blob: &[u8],
     ps: Option<&[u8]>,
     split_wave64: bool,
+    use_vs: bool,
     windows: u32,
     cache_dir: &std::path::Path,
     cache: &Mutex<ShaderCache>,
@@ -1159,17 +1170,46 @@ fn console_mesh_with(
     } else {
         compile_one()?
     };
-    finish_two_pass_compiled(cs, record, ps)
+    finish_two_pass_compiled(cs, record, ps, use_vs)
 }
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_mesh_with_mode(blob, ps, split_wave64, mesh_emulation_forced())
+}
+
+/// `console_mesh` with explicit pass-through mode (`use_vs = true` compiles a `vs_6_6`
+/// vertex-shader fallback instead of `ms_6_6`).
+pub fn console_mesh_with_mode(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, use_vs: bool) -> Result<TwoPass, String> {
     let windows = mem_windows();
     let dir = dxc::cache_dir();
-    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
+    console_mesh_with(blob, ps, split_wave64, use_vs, windows, &dir, shader_cache(), |code, ms, wave64| {
         compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
     })
+}
+
+/// `XCL_MESH_EMULATION=1`: force the vertex-shader (`vs_6_6`) pass-through fallback even when
+/// the GPU supports hardware D3D12 mesh shaders.
+pub fn mesh_emulation_forced() -> bool {
+    std::env::var("XCL_MESH_EMULATION").is_ok_and(|v| v == "1")
+}
+
+/// Whether `device` supports hardware D3D12 mesh shaders (and `XCL_MESH_EMULATION=1` is not set).
+pub fn device_has_mesh_shaders(device: &ID3D12Device) -> bool {
+    if mesh_emulation_forced() {
+        return false;
+    }
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS7).cast(),
+            std::mem::size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -1218,6 +1258,12 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_geometry_with_mode(vs, gs, ps, split_wave64, mesh_emulation_forced())
+}
+
+/// `console_geometry` with explicit pass-through mode (`use_vs = true` compiles a `vs_6_6`
+/// vertex-shader fallback instead of `ms_6_6`).
+pub fn console_geometry_with_mode(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool, use_vs: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
@@ -1226,16 +1272,13 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
-                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers }, record, ps, use_vs);
             }
             Err(e) => direct_fallback("GS", &e),
         }
     }
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
-    finish_two_pass(translation, record, ps)
+    finish_two_pass(translation, record, ps, use_vs)
 }
 
 /// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
@@ -1950,7 +1993,7 @@ mod shader_cache_tests {
         let compiles = AtomicUsize::new(0);
 
         let run = |c: &Mutex<ShaderCache>| {
-            console_mesh_with(&blob, None, false, 1, &dir, c, |code, ms, wave64| {
+            console_mesh_with(&blob, None, false, false, 1, &dir, c, |code, ms, wave64| {
                 compiles.fetch_add(1, Ordering::SeqCst);
                 compile_console_mesh(&blob, code, ms, wave64, 1, false)
             })

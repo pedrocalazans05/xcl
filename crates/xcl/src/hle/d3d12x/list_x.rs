@@ -483,6 +483,11 @@ fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
+/// The PC primitive topology last set on `list`, if any (used to restore after temporary changes).
+pub(super) fn tracked_topology(list: *mut c_void) -> Option<u32> {
+    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.bindings.topology
+}
+
 const PC_IA_SET_PRIMITIVE_TOPOLOGY: usize = 20;
 const PC_RS_SET_VIEWPORTS: usize = 21;
 const PC_RS_SET_SCISSOR_RECTS: usize = 22;
