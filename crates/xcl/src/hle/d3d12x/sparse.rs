@@ -210,9 +210,15 @@ struct State {
     value: u64,
     /// reusable auto-reset Win32 event for fence waits (no per-wait CreateEventW/CloseHandle)
     event: HANDLE,
-    /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
+    /// dedicated readback queue (NEVER waited on by title queues, so waiting on title queues
+    /// here cannot form a circular GPU deadlock `title_qA -> title_qB -> sparse_q -> title_qA`)
+    rb_queue: ID3D12CommandQueue,
+    /// fence signalled on title queues so `rb_queue` waits before copying GPU writes back to CPU
     rb_fence: ID3D12Fence,
     rb_value: u64,
+    /// fence signalled on `rb_queue` for CPU-side readback completion waits
+    rb_done_fence: ID3D12Fence,
+    rb_done_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -523,8 +529,10 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     }
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
+        let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
@@ -541,14 +549,18 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
         let _ = rb_list.SetName(windows::core::w!("xcl sparse readback list"));
         let _ = rb_alloc.SetName(windows::core::w!("xcl sparse readback allocator"));
         let _ = queue.SetName(windows::core::w!("xcl sparse queue"));
+        let _ = rb_queue.SetName(windows::core::w!("xcl sparse readback queue"));
         Ok(State {
             dev: dev.clone(),
             queue,
             fence,
             value: 0,
             event,
+            rb_queue,
             rb_fence,
             rb_value: 0,
+            rb_done_fence,
+            rb_done_value: 0,
             windows,
             pools: Vec::new(),
             free: Vec::new(),
@@ -842,6 +854,35 @@ impl State {
     }
 
     #[inline]
+    unsafe fn order_rb_after_uploads(&self) {
+        if self.value > 0 && self.fence.GetCompletedValue() < self.value {
+            let _ = self.rb_queue.Wait(&self.fence, self.value);
+        }
+    }
+
+    #[inline]
+    unsafe fn signal_rb(&mut self) {
+        self.rb_done_value += 1;
+        let _ = self.rb_queue.Signal(&self.rb_done_fence, self.rb_done_value);
+    }
+
+    #[inline]
+    unsafe fn wait_for_rb(&self, target: u64) {
+        if target == 0 || self.rb_done_fence.GetCompletedValue() >= target {
+            return;
+        }
+        let _ = self.rb_done_fence.SetEventOnCompletion(target, self.event);
+        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        if self.rb_done_fence.GetCompletedValue() < target {
+            crate::xlog_warn!(
+                "sparse: the readback queue has not reached fence value {target} after 5 s (at {})",
+                self.rb_done_fence.GetCompletedValue()
+            );
+            super::real::stop_if_device_removed();
+        }
+    }
+
+    #[inline]
     unsafe fn reclaim_ring(&mut self) {
         if self.inflight.is_empty() {
             return;
@@ -1028,16 +1069,17 @@ impl State {
         let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| {
             if *open {
                 *open = false;
+                s.order_rb_after_uploads();
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
-                            s.queue.ExecuteCommandLists(&[Some(l)]);
+                            s.rb_queue.ExecuteCommandLists(&[Some(l)]);
                         });
                     }
                 }
-                s.signal();
-                s.rb_last_fence = s.value;
-                s.wait_for(s.value);
+                s.signal_rb();
+                s.rb_last_fence = s.rb_done_value;
+                s.wait_for_rb(s.rb_done_value);
                 s.reclaim_ring();
             }
             for &(dst, off, len) in pending.iter() {
@@ -1082,7 +1124,7 @@ impl State {
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
                 if !open {
-                    self.wait_for(self.rb_last_fence);
+                    self.wait_for_rb(self.rb_last_fence);
                     let _ = self.rb_alloc.Reset();
                     let _ = self.rb_list.Reset(&self.rb_alloc, None);
                     open = true;
@@ -1269,8 +1311,8 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.rb_value += 1;
     let v = s.rb_value;
     if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
-        super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
+        let _ = s.rb_queue.Wait(&s.rb_fence, v);
+        super::list_x::note_internal_wait(s.rb_queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
 }
@@ -1461,7 +1503,12 @@ impl State {
 
     unsafe fn sync_known_queues(&mut self) -> bool {
         let mut ok = true;
+        let self_q = self.queue.as_raw() as usize;
+        let rb_q = self.rb_queue.as_raw() as usize;
         for raw in super::present::known_queues() {
+            if raw == 0 || raw == self_q || raw == rb_q {
+                continue;
+            }
             if !self.queue_fences.contains_key(&raw) {
                 let ptr = raw as *mut c_void;
                 if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
@@ -1851,8 +1898,10 @@ mod tests {
             }
             let dev = dev.expect("D3D12 device");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("rb_queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
             let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_done_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -1863,8 +1912,11 @@ mod tests {
                 fence,
                 value: 0,
                 event,
+                rb_queue,
                 rb_fence,
                 rb_value: 0,
+                rb_done_fence,
+                rb_done_value: 0,
                 windows: Vec::new(),
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2058,8 +2110,10 @@ mod tests {
                 .expect("CreateReservedResource");
             let reserved = reserved.expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("rb_queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
             let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_done_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -2071,8 +2125,11 @@ mod tests {
                 fence,
                 value: 0,
                 event,
+                rb_queue,
                 rb_fence,
                 rb_value: 0,
+                rb_done_fence,
+                rb_done_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2155,8 +2212,10 @@ mod tests {
                 .expect("CreateReservedResource");
             let reserved = reserved.expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("rb_queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
             let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_done_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -2168,8 +2227,11 @@ mod tests {
                 fence,
                 value: 0,
                 event,
+                rb_queue,
                 rb_fence,
                 rb_value: 0,
+                rb_done_fence,
+                rb_done_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -2280,8 +2342,10 @@ mod tests {
             .expect("CreateReservedResource");
         let reserved = reserved.expect("reserved buffer");
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+        let rb_queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("rb_queue");
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
         let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+        let rb_done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_done_fence");
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
         let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
         let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -2293,8 +2357,11 @@ mod tests {
             fence,
             value: 0,
             event,
+            rb_queue,
             rb_fence,
             rb_value: 0,
+            rb_done_fence,
+            rb_done_value: 0,
             windows: vec![(base, reserved)],
             pools: Vec::new(),
             free: Vec::new(),
@@ -2625,5 +2692,46 @@ mod tests {
         assert!(!unmask_committed_holes(&mut mapped, &mut runs, t0 + PAGE, PAGE));
         assert_eq!(mapped[&t0].holes, 0xFFFC);
         assert!(runs.is_some());
+    }
+    /// Regression test for the circular GPU deadlock:
+    /// `title_qA -> title_qB -> sparse.queue -> title_qA`.
+    /// When `rb_queue` waits on a gated title queue `title_qA` (`rb_fence`), `sparse.queue`
+    /// (uploads + tile mappings) must remain unblocked so `title_qB` waiting on `sparse.queue`
+    /// can complete and release `title_qA`, unblocking the readback cleanly.
+    #[test]
+    fn readback_on_dedicated_queue_never_blocks_sparse_uploads_behind_gated_title_queue() {
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            let title_q_a: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title_q_a");
+            let title_q_b: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title_q_b");
+            let cross_fence: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("cross_fence");
+
+            // 1. title_q_a waits on title_q_b via cross_fence (not yet signalled by title_q_b).
+            title_q_a.Wait(&cross_fence, 1).expect("qA waits on qB");
+
+            // 2. A readback orders `rb_queue` behind title_q_a via `rb_fence` and signals `rb_done_fence`.
+            s.rb_value += 1;
+            let rb_v = s.rb_value;
+            title_q_a.Signal(&s.rb_fence, rb_v).expect("qA signals rb_fence");
+            s.rb_queue.Wait(&s.rb_fence, rb_v).expect("rb_queue waits on qA");
+            s.signal_rb();
+            let rb_target = s.rb_done_value;
+
+            // 3. Now title_q_b submits work that waits on `sparse.queue` (uploads), then signals cross_fence.
+            //    With the old shared-queue design, `sparse.queue` was stuck behind qA, causing a 3-way deadlock!
+            s.signal();
+            let upload_target = s.value;
+            title_q_b.Wait(&s.fence, upload_target).expect("qB waits on sparse.queue");
+            title_q_b.Signal(&cross_fence, 1).expect("qB releases qA");
+
+            // Both `sparse.queue` AND `rb_queue` must complete well within 5 s (no deadlock!).
+            s.wait_for(upload_target);
+            assert!(s.fence.GetCompletedValue() >= upload_target, "sparse.queue must not be blocked by rb_queue");
+            s.wait_for_rb(rb_target);
+            assert!(s.rb_done_fence.GetCompletedValue() >= rb_target, "rb_queue must complete once qB unblocks qA");
+
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
+        }
     }
 }
