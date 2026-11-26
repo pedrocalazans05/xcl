@@ -19,8 +19,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -333,11 +333,82 @@ fn push_run(out: &mut Vec<(usize, usize)>, addr: usize, len: usize) {
     }
 }
 
-/// Scan a 4 KiB page at `pg`, appending any changed 64-byte chunk runs directly to `out`
-/// (zero per-page heap allocation; skips allocating `slot` completely when a fresh zero page
-/// is still all zeros).
 #[inline]
-fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: OnceLock<bool> = OnceLock::new();
+        *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn is_chunk_zero_avx2(c: &[u8]) -> bool {
+    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, __m256i};
+    debug_assert_eq!(c.len(), CHUNK);
+    let p = c.as_ptr() as *const __m256i;
+    let v0 = _mm256_loadu_si256(p);
+    let v1 = _mm256_loadu_si256(p.add(1));
+    let any = _mm256_or_si256(v0, v1);
+    _mm256_testz_si256(any, any) != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_page_avx2(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
+    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, __m256i};
+    if let Some(sent) = slot.as_deref_mut() {
+        for (k, c) in page.chunks_exact(CHUNK).enumerate() {
+            if sent[k] == ZERO_HASH && is_chunk_zero_avx2(c) {
+                continue;
+            }
+            let h = chunk_hash(c);
+            if h == sent[k] {
+                continue;
+            }
+            sent[k] = h;
+            push_run(out, pg + k * CHUNK, CHUNK);
+        }
+        return;
+    }
+    // Fresh all-zero page fast path: scan 128 bytes (2 chunks) per iteration with AVX2.
+    let ptr = page.as_ptr() as *const __m256i;
+    let pairs = page.len() / (CHUNK * 2);
+    let mut first_nz_chunk = None;
+    for pair in 0..pairs {
+        let base = ptr.add(pair * 4);
+        let a = _mm256_or_si256(_mm256_loadu_si256(base), _mm256_loadu_si256(base.add(1)));
+        let b = _mm256_or_si256(_mm256_loadu_si256(base.add(2)), _mm256_loadu_si256(base.add(3)));
+        let any = _mm256_or_si256(a, b);
+        if _mm256_testz_si256(any, any) == 0 {
+            let k0 = pair * 2;
+            first_nz_chunk = Some(if _mm256_testz_si256(a, a) == 0 { k0 } else { k0 + 1 });
+            break;
+        }
+    }
+    let Some(start_k) = first_nz_chunk else { return };
+    for (k, c) in page.chunks_exact(CHUNK).enumerate().skip(start_k) {
+        if is_chunk_zero_avx2(c) {
+            continue;
+        }
+        let h = chunk_hash(c);
+        if h == ZERO_HASH {
+            continue;
+        }
+        let sent = slot.get_or_insert_with(|| Box::new(ZERO_HASHES));
+        sent[k] = h;
+        push_run(out, pg + k * CHUNK, CHUNK);
+    }
+}
+
+#[inline]
+fn scan_page_scalar(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
     if let Some(sent) = slot.as_deref_mut() {
         for (k, c) in page.chunks_exact(CHUNK).enumerate() {
             let h = chunk_hash(c);
@@ -373,6 +444,254 @@ fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out:
             push_run(out, pg + k2 * CHUNK, CHUNK);
         }
         break;
+    }
+}
+
+/// Scan a 4 KiB page at `pg`, appending any changed 64-byte chunk runs directly to `out`
+/// (zero per-page heap allocation; skips allocating `slot` completely when a fresh zero page
+/// is still all zeros; uses AVX2 zero-skipping when available).
+#[inline]
+fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() && page.len() == PAGE {
+        unsafe {
+            scan_page_avx2(page, pg, slot, out);
+        }
+        return;
+    }
+    scan_page_scalar(page, pg, slot, out);
+}
+
+/// Minimum dirty pages in one `before_execute` before fanning out `scan_page` across `ScanPool`.
+const PARALLEL_SCAN_PAGES: usize = 64;
+const MAX_SCAN_THREADS: usize = 6;
+
+fn scan_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("XCL_SPARSE_SCAN_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            return n.clamp(1, 16);
+        }
+        std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, MAX_SCAN_THREADS)
+    })
+}
+
+struct ScanPoolState {
+    gen: u64,
+    active_helpers: usize,
+    pending_helpers: usize,
+    func: Option<unsafe fn(*const c_void)>,
+    ctx: usize,
+}
+
+/// Persistent worker pool for parallel dirty-page chunk scanning in `before_execute` (avoids
+/// per-submit thread creation overhead while keeping tile hash state lock-free per page).
+struct ScanPool {
+    run_lock: Mutex<()>,
+    state: Arc<(Mutex<ScanPoolState>, Condvar, Condvar)>,
+    helpers: usize,
+}
+
+impl ScanPool {
+    fn new(max_threads: usize) -> Self {
+        let helpers = max_threads.saturating_sub(1);
+        let state = Arc::new((
+            Mutex::new(ScanPoolState { gen: 0, active_helpers: 0, pending_helpers: 0, func: None, ctx: 0 }),
+            Condvar::new(),
+            Condvar::new(),
+        ));
+        let mut spawned = 0usize;
+        for _ in 0..helpers {
+            let id = spawned;
+            let shared = Arc::clone(&state);
+            if std::thread::Builder::new()
+                .name(format!("xcl-sparse-scan-{id}"))
+                .spawn(move || {
+                    let mut seen = 0u64;
+                    loop {
+                        let job = {
+                            let mut g = shared.0.lock().unwrap();
+                            while g.gen == seen {
+                                g = shared.1.wait(g).unwrap();
+                            }
+                            seen = g.gen;
+                            if id < g.active_helpers { g.func.map(|f| (f, g.ctx)) } else { None }
+                        };
+                        if let Some((func, ctx)) = job {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { func(ctx as *const c_void) }));
+                            let mut g = shared.0.lock().unwrap();
+                            g.pending_helpers -= 1;
+                            if g.pending_helpers == 0 {
+                                shared.2.notify_one();
+                            }
+                        }
+                    }
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+        ScanPool { run_lock: Mutex::new(()), state, helpers: spawned }
+    }
+
+    fn run<F: Fn() + Sync>(&self, total_threads: usize, f: &F) {
+        let helpers = total_threads.saturating_sub(1).min(self.helpers);
+        if helpers == 0 {
+            f();
+            return;
+        }
+        unsafe fn trampoline<F: Fn() + Sync>(ctx: *const c_void) {
+            (*(ctx as *const F))();
+        }
+        let _serial = self.run_lock.lock().unwrap();
+        {
+            let mut g = self.state.0.lock().unwrap();
+            g.func = Some(trampoline::<F>);
+            g.ctx = (f as *const F) as usize;
+            g.active_helpers = helpers;
+            g.pending_helpers = helpers;
+            g.gen = g.gen.wrapping_add(1);
+            self.state.1.notify_all();
+        }
+        let caller_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        {
+            let mut g = self.state.0.lock().unwrap();
+            while g.pending_helpers > 0 {
+                g = self.state.2.wait(g).unwrap();
+            }
+            g.func = None;
+            g.ctx = 0;
+            g.active_helpers = 0;
+        }
+        if let Err(payload) = caller_res {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+fn scan_pool() -> &'static ScanPool {
+    static POOL: OnceLock<ScanPool> = OnceLock::new();
+    POOL.get_or_init(|| ScanPool::new(scan_threads()))
+}
+
+/// Disjoint page work item for parallel `scan_page` execution.
+#[derive(Clone, Copy)]
+struct ScanItem {
+    pg: usize,
+    slot: *mut Option<Box<[u64; CHUNKS]>>,
+}
+
+// SAFETY: `scan_dirty_pages_into` deduplicates sorted `pg` values before constructing `ScanItem`s,
+// so every item owns a unique `(tile, idx)` hash slot and reads immutable title memory at `pg`.
+unsafe impl Sync for ScanItem {}
+unsafe impl Send for ScanItem {}
+
+/// Scan all write-watched `dirty` pages (sorted ascending, `page` bytes each) overlapping `mapped`,
+/// appending coalesced changed 64-byte runs into `out` in ascending address order. Uses the
+/// persistent `ScanPool` when at least `PARALLEL_SCAN_PAGES` mapped pages are dirty.
+unsafe fn scan_dirty_pages_into(
+    mapped: &mut FxHashMap<usize, TileEntry>,
+    dirty: &[usize],
+    page: usize,
+    max_threads: usize,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    // Small dirty sets scan directly with zero intermediate allocation.
+    if dirty.len() < PARALLEL_SCAN_PAGES || max_threads <= 1 {
+        let mut i = 0;
+        while i < dirty.len() {
+            let a = dirty[i];
+            let mut n = page;
+            i += 1;
+            while i < dirty.len() && dirty[i] == a + n {
+                n += page;
+                i += 1;
+            }
+            let mut x = a;
+            while x < a + n {
+                let t = x & !(TILE - 1);
+                let end = (t + TILE).min(a + n);
+                if let Some(entry) = mapped.get_mut(&t) {
+                    let mut pg = x & !(PAGE - 1);
+                    while pg < end {
+                        let idx = (pg - t) / PAGE;
+                        if entry.holes & (1u16 << idx) == 0 {
+                            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                            scan_page(bytes, pg, &mut entry.sent[idx], out);
+                        }
+                        pg += PAGE;
+                    }
+                }
+                x = end;
+            }
+        }
+        return;
+    }
+
+    // Collect deduplicated, ascending `(pg, &mut entry.sent[idx])` pairs once under `&mut mapped`.
+    let mut items: Vec<ScanItem> = Vec::with_capacity(dirty.len());
+    let mut last_pg = usize::MAX;
+    let mut i = 0;
+    while i < dirty.len() {
+        let a = dirty[i];
+        let mut n = page;
+        i += 1;
+        while i < dirty.len() && dirty[i] == a + n {
+            n += page;
+            i += 1;
+        }
+        let mut x = a;
+        while x < a + n {
+            let t = x & !(TILE - 1);
+            let end = (t + TILE).min(a + n);
+            if let Some(entry) = mapped.get_mut(&t) {
+                let mut pg = x & !(PAGE - 1);
+                while pg < end {
+                    if pg != last_pg {
+                        last_pg = pg;
+                        let idx = (pg - t) / PAGE;
+                        if entry.holes & (1u16 << idx) == 0 {
+                            items.push(ScanItem { pg, slot: &mut entry.sent[idx] as *mut _ });
+                        }
+                    }
+                    pg += PAGE;
+                }
+            }
+            x = end;
+        }
+    }
+
+    if items.len() < PARALLEL_SCAN_PAGES {
+        for item in items {
+            let bytes = std::slice::from_raw_parts(item.pg as *const u8, PAGE);
+            scan_page(bytes, item.pg, &mut *item.slot, out);
+        }
+        return;
+    }
+
+    let threads = max_threads.min(items.len() / 16).max(1);
+    let chunk_len = items.len().div_ceil(threads);
+    let chunks: Vec<&[ScanItem]> = items.chunks(chunk_len).collect();
+    let buckets: Vec<Mutex<Vec<(usize, usize)>>> = (0..chunks.len()).map(|_| Mutex::new(Vec::new())).collect();
+    let next = AtomicUsize::new(0);
+    scan_pool().run(chunks.len(), &|| loop {
+        let b = next.fetch_add(1, Ordering::Relaxed);
+        let Some(&slice) = chunks.get(b) else { break };
+        let mut local = Vec::new();
+        for &item in slice {
+            let bytes = std::slice::from_raw_parts(item.pg as *const u8, PAGE);
+            scan_page(bytes, item.pg, &mut *item.slot, &mut local);
+        }
+        *buckets[b].lock().unwrap() = local;
+    });
+    for b in buckets {
+        for (addr, len) in b.into_inner().unwrap() {
+            push_run(out, addr, len);
+        }
     }
 }
 
@@ -1646,34 +1965,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
-    let mut i = 0;
-    while i < dirty.len() {
-        let a = dirty[i];
-        let mut n = page;
-        i += 1;
-        while i < dirty.len() && dirty[i] == a + n {
-            n += page;
-            i += 1;
-        }
-        // only what has video memory (committed tiles of a sparse window)
-        let mut x = a;
-        while x < a + n {
-            let t = x & !(TILE - 1);
-            let end = (t + TILE).min(a + n);
-            if let Some(entry) = s.mapped.get_mut(&t) {
-                let mut pg = x & !(PAGE - 1);
-                while pg < end {
-                    let idx = (pg - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
-                    }
-                    pg += PAGE;
-                }
-            }
-            x = end;
-        }
-    }
+    scan_dirty_pages_into(&mut s.mapped, dirty, page, scan_threads(), &mut dirty_runs);
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
@@ -2020,6 +2312,108 @@ mod tests {
         let mut next_slot: Option<Box<[u64; CHUNKS]>> = None;
         scan_page(&next, 0x1_1000, &mut next_slot, &mut out);
         assert_eq!(out, vec![(0x1_0FC0, 128)]);
+    }
+
+    #[test]
+    fn scan_page_avx2_matches_scalar_bit_for_bit() {
+        let mut page = vec![0u8; PAGE];
+        let mut slot_a: Option<Box<[u64; CHUNKS]>> = None;
+        let mut slot_b: Option<Box<[u64; CHUNKS]>> = None;
+        let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+
+        // Step 1: all-zero fresh page (neither allocates)
+        scan_page(&page, 0x2_0000, &mut slot_a, &mut out_a);
+        scan_page_scalar(&page, 0x2_0000, &mut slot_b, &mut out_b);
+        assert_eq!(out_a, out_b);
+        assert!(slot_a.is_none() && slot_b.is_none());
+
+        // Step 2: sparse non-zero writes across odd/even 64B chunks (including last byte)
+        for &off in &[0usize, 63, 64, 191, 512, 2048, PAGE - 1] {
+            page[off] = (off as u8).wrapping_mul(37).wrapping_add(1);
+        }
+        scan_page(&page, 0x2_0000, &mut slot_a, &mut out_a);
+        scan_page_scalar(&page, 0x2_0000, &mut slot_b, &mut out_b);
+        assert_eq!(out_a, out_b);
+        assert_eq!(slot_a.as_deref(), slot_b.as_deref());
+
+        // Step 3: re-scan unchanged page (no runs)
+        out_a.clear();
+        out_b.clear();
+        scan_page(&page, 0x2_0000, &mut slot_a, &mut out_a);
+        scan_page_scalar(&page, 0x2_0000, &mut slot_b, &mut out_b);
+        assert_eq!(out_a, out_b);
+        assert!(out_a.is_empty());
+
+        // Step 4: zero out some previously non-zero chunks and mutate another
+        page[64] = 0;
+        page[512] = 0;
+        page[1024] = 0x5A;
+        scan_page(&page, 0x2_0000, &mut slot_a, &mut out_a);
+        scan_page_scalar(&page, 0x2_0000, &mut slot_b, &mut out_b);
+        assert_eq!(out_a, out_b);
+        assert_eq!(slot_a.as_deref(), slot_b.as_deref());
+    }
+
+    #[test]
+    fn parallel_scan_dirty_pages_matches_serial_bit_for_bit() {
+        // Allocate a 64 KiB-aligned backing buffer of 16 tiles (256 pages = 1 MiB) via VirtualAlloc
+        // so `t = x & !(TILE - 1)` aligns cleanly with `MappedTile` boundaries.
+        const NUM_TILES: usize = 16;
+        const TOTAL_BYTES: usize = NUM_TILES * TILE;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), TOTAL_BYTES, MEM_COMMIT | 0x2000, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert_eq!(base % TILE, 0);
+            let mem = std::slice::from_raw_parts_mut(base as *mut u8, TOTAL_BYTES);
+            // Seed deterministic pattern across every other page + boundary-spanning chunks.
+            for p in 0..(NUM_TILES * PAGES_PER_TILE) {
+                if p % 3 == 0 {
+                    mem[p * PAGE] = (p as u8).wrapping_add(1);
+                    mem[p * PAGE + PAGE - 1] = (p as u8).wrapping_mul(13).wrapping_add(7);
+                } else if p % 3 == 1 {
+                    // Adjacent start chunk to force boundary coalescing across worker slices
+                    mem[p * PAGE] = 0xEE;
+                }
+            }
+            let make_map = || -> FxHashMap<usize, TileEntry> {
+                let mut m = FxHashMap::default();
+                for ti in 0..NUM_TILES {
+                    // Mark page 5 as a hole on odd tiles
+                    let holes = if ti % 2 == 1 { 1u16 << 5 } else { 0 };
+                    m.insert(base + ti * TILE, TileEntry::with_holes((0, ti as u32), holes));
+                }
+                m
+            };
+            let mut dirty: Vec<usize> = (0..(NUM_TILES * PAGES_PER_TILE)).map(|p| base + p * PAGE).collect();
+            // Inject a duplicate entry to verify deduplication safety.
+            dirty.insert(40, dirty[40]);
+
+            let mut serial_map = make_map();
+            let mut parallel_map = make_map();
+            let (mut out_serial, mut out_parallel) = (Vec::new(), Vec::new());
+
+            scan_dirty_pages_into(&mut serial_map, &dirty, PAGE, 1, &mut out_serial);
+            scan_dirty_pages_into(&mut parallel_map, &dirty, PAGE, 6, &mut out_parallel);
+            assert_eq!(out_parallel, out_serial, "parallel scan must match serial scan bit-for-bit");
+            assert!(!out_parallel.is_empty());
+
+            // Second pass with no changes must emit zero runs on both.
+            out_serial.clear();
+            out_parallel.clear();
+            scan_dirty_pages_into(&mut serial_map, &dirty, PAGE, 1, &mut out_serial);
+            scan_dirty_pages_into(&mut parallel_map, &dirty, PAGE, 6, &mut out_parallel);
+            assert!(out_serial.is_empty() && out_parallel.is_empty());
+
+            // Mutate one byte on every 4th page and re-verify parity.
+            for p in (0..(NUM_TILES * PAGES_PER_TILE)).step_by(4) {
+                mem[p * PAGE + 128] ^= 0xFF;
+            }
+            scan_dirty_pages_into(&mut serial_map, &dirty, PAGE, 1, &mut out_serial);
+            scan_dirty_pages_into(&mut parallel_map, &dirty, PAGE, 6, &mut out_parallel);
+            assert_eq!(out_parallel, out_serial, "second mutation pass must match serial bit-for-bit");
+
+            VirtualFree(base as *mut c_void, 0, 0x8000);
+        }
     }
 
     /// Ring-buffer planner keeps every chunk contiguous, 64-byte aligned, <= cap/2, and splits

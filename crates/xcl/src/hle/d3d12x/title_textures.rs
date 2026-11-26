@@ -1038,9 +1038,48 @@ fn same_as_last_upload(res: usize, h: u64) -> bool {
     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
 }
 
-/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
-/// 8-byte words: gigabytes a second; not for anything adversarial).
-fn content_hash(b: &[u8]) -> u64 {
+#[inline]
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn is_zero_avx2(b: &[u8]) -> bool {
+    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, __m256i};
+    let mut ptr = b.as_ptr();
+    let mut rem = b.len();
+    while rem >= 128 {
+        let p = ptr as *const __m256i;
+        let a = _mm256_or_si256(_mm256_loadu_si256(p), _mm256_loadu_si256(p.add(1)));
+        let c = _mm256_or_si256(_mm256_loadu_si256(p.add(2)), _mm256_loadu_si256(p.add(3)));
+        let any = _mm256_or_si256(a, c);
+        if _mm256_testz_si256(any, any) == 0 {
+            return false;
+        }
+        ptr = ptr.add(128);
+        rem -= 128;
+    }
+    while rem >= 32 {
+        let v = _mm256_loadu_si256(ptr as *const __m256i);
+        if _mm256_testz_si256(v, v) == 0 {
+            return false;
+        }
+        ptr = ptr.add(32);
+        rem -= 32;
+    }
+    std::slice::from_raw_parts(ptr, rem).iter().all(|&x| x == 0)
+}
+
+fn content_hash_scalar(b: &[u8]) -> u64 {
     const K: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut h = [K, K.rotate_left(17), K.rotate_left(31), K.rotate_left(47)];
     let mut chunks = b.chunks_exact(32);
@@ -1055,6 +1094,21 @@ fn content_hash(b: &[u8]) -> u64 {
         tail = (tail ^ ((x as u64) << (8 * (k % 8)))).wrapping_mul(K).rotate_left(23);
     }
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
+}
+
+fn zero_page_hash_4k() -> u64 {
+    static H: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *H.get_or_init(|| content_hash_scalar(&[0u8; 4096]))
+}
+
+/// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+/// 8-byte words: gigabytes a second; AVX2 fast-zero shortcut on 4 KiB pages).
+fn content_hash(b: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if b.len() == 4096 && has_avx2() && unsafe { is_zero_avx2(b) } {
+        return zero_page_hash_4k();
+    }
+    content_hash_scalar(b)
 }
 
 /// Frame milestones (relative to last upload or detected content change) at which unwatched
@@ -1676,6 +1730,18 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_hash_avx2_zero_fast_path_matches_scalar() {
+        let mut page = vec![0u8; 4096];
+        assert_eq!(content_hash(&page), content_hash_scalar(&page));
+        for &off in &[0usize, 31, 32, 127, 128, 2047, 4095] {
+            page[off] = 1;
+            assert_eq!(content_hash(&page), content_hash_scalar(&page), "mismatch at offset {off}");
+            page[off] = 0;
+        }
+        assert_eq!(content_hash(&page), content_hash_scalar(&page));
+    }
 
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.

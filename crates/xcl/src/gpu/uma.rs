@@ -782,11 +782,22 @@ fn coherent_file() -> std::path::PathBuf {
     crate::state::data_dir().join("cache").join("uma_coherent.txt")
 }
 
+/// Optional upper cap on the coherent window(s) in bytes (`XCL_COHERENT_CAP_MB`), keeping
+/// `uma_coherent.txt` auto-growth bounded so large general-purpose title heaps stay out of
+/// GPU-writable Window 3 when desired.
+fn coherent_cap_bytes(max_cap: usize) -> usize {
+    std::env::var("XCL_COHERENT_CAP_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| (mb << 20).clamp(GRAIN, max_cap))
+        .unwrap_or(max_cap)
+}
+
 /// Bytes the coherent window(s) are made with for a runtime layout of `windows` windows.
 pub fn coherent_hint_for(windows: usize) -> usize {
-    let cap = max_coherent_bytes(windows);
+    let cap = coherent_cap_bytes(max_coherent_bytes(windows));
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
-        return (mb << 20).clamp(GRAIN, cap);
+        return (mb << 20).clamp(GRAIN, max_coherent_bytes(windows));
     }
     let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
@@ -799,7 +810,7 @@ pub fn coherent_hint_for(windows: usize) -> usize {
             free_commit() >> 20,
             NEEDS_FOR_COHERENT_HEAPS >> 20
         );
-        return RUNTIME_COMMITTED_CAP;
+        return RUNTIME_COMMITTED_CAP.min(cap);
     }
     (title + RUNTIME_COMMITTED_CAP).min(cap)
 }
