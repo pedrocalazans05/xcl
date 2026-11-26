@@ -2377,6 +2377,15 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+        // Unaligned 88 KiB mip-chain siblings at +0x4000 own page +0x1_0000 plus 1 extra_page;
+        // an aligned 64 KiB cover at +0x1_0000 supersedes both without allocating a new base page.
+        let tex_88k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 8, 28, 0x105)).unwrap());
+        assert_eq!(tex_88k.size(), 0x1_6000);
+        assert_eq!(tbl.insert(30, entry(0x30_4000, &tex_88k, true, true)), (1, vec![]));
+        assert_eq!(tbl.insert(31, entry(0x30_4000, &tex_88k, true, true)), (0, vec![]));
+        let (_, mut unmap_unaligned) = tbl.insert(32, entry(0x31_0000, &tex_64k, true, true));
+        unmap_unaligned.sort_unstable();
+        assert_eq!(unmap_unaligned, vec![30, 31]);
     }
 
     /// Real GPU: render targets at two addresses of one physical page (mapped at the second after
@@ -2597,6 +2606,7 @@ mod tests {
             // 1. Streaming 512 unreleased 1 MiB textures (512 MiB placed) across 16 MiB stays bounded
             // with zero additional page growth after the 16 MiB working set is covered.
             let dev_key = dev.as_raw() as usize;
+            super::super::vram::flush_idle_for(dev_key);
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let stream_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 64KB_S, 1 MiB
             let (pages0, vram0, kept0) = (dev_pages(), local_vram(), counts().0);
@@ -2666,10 +2676,13 @@ mod tests {
             assert_eq!(read_sub(&old_res, 0), subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data, "reactivated unmapped texture remapped cleanly");
             drop(old_res);
 
-            // 3. 4 KiB-aligned adjacent textures inside one 64 KiB page + straddling page boundary,
-            // plus reclaiming dead extra_pages when overwritten by a larger placement without Release.
+            // 3. 4 KiB-aligned adjacent small textures pack into 4 KiB sub-allocated slots (no 64 KiB
+            // bloat per small texture), reuse the exact slot at the same va without crosstalk, and
+            // >= 64 KiB unaligned textures reclaim dead extra_pages immediately when overwritten.
+            super::super::vram::flush_idle_for(dev_key);
             let d16 = console_desc(3, 64, 64, 1, 1, 28, 0x105); // 4KB_S, 16 KiB
             let d64 = console_desc(3, 128, 128, 1, 1, 28, 0x105); // 4KB_S, 64 KiB
+            let adj_base_pages = dev_pages();
             let adj_specs = [(0x0000usize, d16, 0x11u8), (0x4000, d16, 0x22), (0x8000, d16, 0x33), (0xC000, d64, 0x44), (0x1_C000, d16, 0x55)];
             let adj: Vec<_> = adj_specs.iter().map(|&(off, d, _)| place_tex(base + off, &d)).collect();
             for &(off, d, seed) in &adj_specs {
@@ -2680,36 +2693,37 @@ mod tests {
                 assert_eq!(read_sub(r, 0), subresources(base + off, &xg::Texture::new(&d).unwrap())[0].data, "4 KiB neighbour at +{off:#x} crosstalk");
             }
             let pages_before_reuse = dev_pages();
-            // Binding sweeps pages idle for two seconds, so the device-wide count can fall
-            // here even when this placement shares the extra tile it already has.
-            let first = adj[1].as_raw() as usize;
-            let before = super::super::vram::mapped_tiles_for(dev_key, first);
+            let adj_delta = pages_before_reuse - adj_base_pages;
+            assert!(adj_delta <= 128 * 1024, "four 16 KiB + one 64 KiB textures should use <= 128 KiB, got {adj_delta} B");
             let reused = place_tex(base + 0x4000, &d16);
-            if super::super::vram::is_placed_texture(first) {
-                let before = before.expect("the first unaligned placement is mapped");
-                assert!(!before.1.is_empty(), "a 16 KiB texture in a 64 KiB page uses an extra tile");
-                assert_eq!(
-                    super::super::vram::mapped_tiles_for(dev_key, first).as_ref(),
-                    Some(&before),
-                    "the first placement keeps its tiles when the va is placed again",
-                );
-                assert_eq!(
-                    super::super::vram::mapped_tiles_for(dev_key, reused.as_raw() as usize).as_ref().map(|t| &t.1),
-                    Some(&before.1),
-                    "reusing unaligned va must share extra_pages tile",
-                );
-            } else {
-                assert_eq!(dev_pages(), pages_before_reuse, "reusing unaligned va must share extra_pages tile");
-            }
-            // Overwrite the first 64 KiB (covering +0x0000, +0x4000 (both adj[1] & reused), +0x8000, +0xC000)
-            // WITHOUT releasing adj/reused: dead extra_pages (+0x4000, +0x8000) must drop immediately!
-            let cover = place_tex(base, &d64);
+            assert_eq!(dev_pages(), pages_before_reuse, "reusing unaligned va must share backing slot");
+            drop((reused, adj));
+
+            // Reclaiming dead extra_pages immediately when a >= 64 KiB unaligned tiled texture is
+            // overwritten by an overlapping placement without Release:
+            // `unaligned_a`/`b` at `base + 0x4000` (88 KiB, 2 tiles) own page `base + 0x1_0000`
+            // plus 1 `extra_pages` tile; `cover` at `base + 0x1_0000` reuses that already-live
+            // owned page (+0 new pages) while superseding both unaligned siblings and reclaiming
+            // their `extra_pages` tile immediately (-64 KiB).
+            super::super::vram::flush_idle_for(dev_key);
+            let d64_mips = console_desc(3, 128, 128, 1, 8, 28, 0x105); // 88 KiB, 2 tiles (mip 0 + packed mips)
+            let extra_before = super::super::vram::extra_page_bytes_for(dev_key);
+            let unaligned_a = place_tex(base + 0x4000, &d64_mips);
+            let extra_after_a = super::super::vram::extra_page_bytes_for(dev_key);
+            assert!(extra_after_a > extra_before, "unaligned >= 64 KiB tiled texture must allocate extra_pages ({extra_before} -> {extra_after_a})");
+            let unaligned_b = place_tex(base + 0x4000, &d64_mips);
+            assert_eq!(super::super::vram::extra_page_bytes_for(dev_key), extra_after_a, "reusing unaligned va must share extra_pages tile");
+            let pages_with_extra = dev_pages();
+            let cover = place_tex(base + 0x1_0000, &d64);
             let pages_after_cover = dev_pages();
-            assert!(pages_after_cover < pages_before_reuse, "superseded unaligned extra_pages must be reclaimed immediately ({pages_before_reuse} -> {pages_after_cover})");
-            drop((cover, reused, adj));
+            let extra_after_cover = super::super::vram::extra_page_bytes_for(dev_key);
+            assert_eq!(extra_after_cover, extra_before, "superseded unaligned extra_pages must drop back to baseline ({extra_after_a} -> {extra_after_cover})");
+            assert!(pages_after_cover < pages_with_extra, "superseded unaligned extra_pages must be reclaimed immediately ({pages_with_extra} -> {pages_after_cover})");
+            drop((cover, unaligned_b, unaligned_a));
 
             // 4. Full mip chain (standard + packed mips, RGBA8 & BC7), tiny all-packed mips,
             // 6-slice cubemap (exercises extra_pages reuse), and 3D volume texture (Tier 3).
+            super::super::vram::flush_idle_for(dev_key);
             let shapes = [
                 ("2D 512x512 RGBA8 10 mips", console_desc(3, 512, 512, 1, 10, 28, 0x109)),
                 ("2D 1024x1024 BC7 11 mips", console_desc(3, 1024, 1024, 1, 11, 98, 0x109)),
@@ -2997,6 +3011,7 @@ mod tests {
 
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
             let dev_key = dev.as_raw() as usize;
+            super::super::vram::flush_idle_for(dev_key);
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let p0 = dev_pages();
             let small = place_tex(at);
