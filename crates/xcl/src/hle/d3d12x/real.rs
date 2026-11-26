@@ -1306,7 +1306,7 @@ fn view_shape_desc(
 ) -> Option<(u32, crate::gpu::desc::ImageType, u32, u32, u32, u32, u32, u32)> {
     use crate::gpu::desc::ImageType as T;
     let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { r.Format } else { format };
-    let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
+    let fmt = view_tsharp_format(f);
     let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
     let ty = view_dim_to_image_type(dim)?;
     let depth = match ty {
@@ -1330,6 +1330,16 @@ fn view_shape_desc(
         (base, last, res_max_mip.min(15))
     };
     Some((fmt, ty, w, h, depth, base_level, last_level, max_mip))
+}
+
+/// The GFX10 format in the T# of a view in PC format `f` (0, a float image, when the table has
+/// none). The PC's stencil views (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT) are not in the
+/// table but are UINT views: they get 8_UINT, so that translated shaders load them as integers
+/// (`img_cls`); a float load of a UINT view is undefined in D3D12.
+fn view_tsharp_format(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> u32 {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UINT, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT};
+    let f = if f == DXGI_FORMAT_X24_TYPELESS_G8_UINT || f == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT { DXGI_FORMAT_R8_UINT } else { f };
+    crate::gpu::desc::gfx10_format(f).unwrap_or(0)
 }
 
 /// Build the XCL shader-ABI T# for an SRV, populating GFX10 `BASE_LEVEL` (`t[3][15:12]`),
@@ -2526,7 +2536,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         // so write a valid T# referencing `slot.index` with the view's format class and type.
         if let Some(v) = desc.as_ref() {
             if let Some(ty) = view_dim_to_image_type(v.ViewDimension.0) {
-                let fmt = crate::gpu::desc::gfx10_format(v.Format).unwrap_or(0);
+                let fmt = view_tsharp_format(v.Format);
                 let depth = if ty == crate::gpu::desc::ImageType::Cube { 6 } else { 1 };
                 return super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, 1, 1, depth, 1));
             }
@@ -2908,7 +2918,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
                     g(this, std::ptr::null_mut(), &srv, slot.pc_srv);
                     super::console_heap::publish(&slot, false);
                 }
-                let fmt = crate::gpu::desc::gfx10_format(v.Format).unwrap_or(0);
+                let fmt = view_tsharp_format(v.Format);
                 return super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, 1, 1, 1, 1));
             }
         }
@@ -7421,6 +7431,86 @@ mod pso_blend_and_tsharp_tests {
         };
         let img_arr = crate::gpu::desc::image(&srv_tsharp_from_desc(11, &msaa_arr, Some(&msaa_arr_srv)).unwrap()).unwrap();
         assert_eq!((img_arr.ty, img_arr.depth, img_arr.base_level, img_arr.last_level), (crate::gpu::desc::ImageType::D2MsaaArray, 4, 0, 2));
+    }
+
+    /// A stencil view is a UINT view: its T# has a uint format, so translated shaders load it as
+    /// integers (`img_cls`: the buffer-format table's numeric type 4); the depth view stays float.
+    #[test]
+    fn srv_tsharp_of_a_stencil_view_has_a_uint_format() {
+        let class = |fmt: u32| (crate::gpu::recomp::emit::buf_format_info(fmt as usize) >> 3) & 7;
+        for (resource, stencil, depth) in [
+            (DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS),
+            (DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS),
+        ] {
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 2560,
+                Height: 1440,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: resource,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            let view = |format, plane| D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: plane, ResourceMinLODClamp: 0.0 },
+                },
+            };
+            let s = crate::gpu::desc::image(&srv_tsharp_from_desc(5, &rd, Some(&view(stencil, 1))).unwrap()).unwrap();
+            assert_eq!((s.format, class(s.format)), (5, 4), "stencil view {stencil:?}: T# format 8_UINT, uint class");
+            assert_eq!((s.width, s.height), (2560, 1440));
+            let d = crate::gpu::desc::image(&srv_tsharp_from_desc(6, &rd, Some(&view(depth, 0))).unwrap()).unwrap();
+            assert_ne!(class(d.format), 4, "depth view {depth:?} stays a float image");
+        }
+    }
+
+    /// A translated `image_load` of a stencil view (the T# `srv_tsharp_from_desc` writes for it)
+    /// gives the stencil values: in the second component, as the PC view has them.
+    #[test]
+    fn gpu_image_load_of_a_stencil_view_gives_the_stencil() {
+        use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
+        use crate::gpu::rdna2::encode;
+        match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+            (Ok(_), Ok(true), Ok(_)) => {}
+            (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+        }
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 1, ResourceMinLODClamp: 0.0 } },
+        };
+        // the runner's SRV of texture 0 is at heap index 0
+        let t = srv_tsharp_from_desc(0, &rd, Some(&view)).unwrap();
+        let mut code = encode("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x2), ("DIM", 1), ("UNORM", 1)], None).unwrap();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut st = KernelState::default();
+        st.sgpr[16..24].copy_from_slice(&t);
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = (l % 8) as u32;
+            r[1] = (l / 8) as u32;
+        }
+        let stencil: Vec<u8> = (0..64).map(|k| 0x40 + k as u8).collect();
+        let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_X24_TYPELESS_G8_UINT, width: 8, height: 8, depth: 1, texel_bytes: 1, data: stencil, uav: false }];
+        let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+        let bad: Vec<String> = (0..64).filter(|&l| r.vgpr[l][10] != 0x40 + l as u32).map(|l| format!("lane {l}: {:#x}", r.vgpr[l][10])).collect();
+        assert!(bad.is_empty(), "image_load of a stencil view (want 0x40 + lane):\n{}", bad.join("\n"));
     }
 }
 
