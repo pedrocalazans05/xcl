@@ -244,6 +244,9 @@ struct State {
     queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// placed buffers whose tiles wait for their first use (`place_buffer_when`, `use_range`):
+    /// (resource, first tile address, bytes from there)
+    lazy: Vec<(usize, usize, usize)>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -890,6 +893,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             quarantined: VecDeque::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
+            lazy: Vec::new(),
             to_zero: Vec::new(),
             staging: None,
             ring_write: 0,
@@ -2014,6 +2018,13 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
+    place_buffer_when(this, va, desc, state, riid, ppv, false)
+}
+
+/// `place_buffer`; with `lazy` the buffer's tiles get no video memory until `use_range` names an
+/// address of it (until then its unmapped tiles read 0 and drop writes). For buffers only the
+/// GPU uses, which a title can place by the hundred long before it uses them.
+pub unsafe fn place_buffer_when(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void, lazy: bool) -> Option<(crate::util::HRESULT, usize)> {
     let mut g = lock_state();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
@@ -2037,19 +2048,82 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
     }
-    // its tiles: the window's video memory at the same addresses; probe actual OS commitment
-    // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
-    s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
-    let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
     let raw = *ppv;
-    let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
-    s.map_tiles(&res, start, &tiles);
-    for &(_, tile) in &tiles {
-        *s.pinned.entry(tile).or_default() += 1;
+    if lazy {
+        s.lazy.push((raw as usize, start, delta + bytes));
+        publish_lazy_bounds(s);
+        return Some((hr, delta));
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
+    s.back_buffer(&res, start, delta + bytes);
     s.signal();
     Some((hr, delta))
+}
+
+/// (lowest, highest) address of the buffers waiting for their tiles (`State::lazy`; 0, 0: none):
+/// what `use_range` checks before it takes the state's lock
+static LAZY_BOUNDS: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+fn publish_lazy_bounds(s: &State) {
+    let (lo, hi) = s.lazy_bounds();
+    LAZY_BOUNDS[0].store(lo, Ordering::Release);
+    LAZY_BOUNDS[1].store(hi, Ordering::Release);
+}
+
+/// `[va, va + len)` of the sparse windows is about to be used by the GPU (a view or root address
+/// of a draw or dispatch, a copy, indirect arguments): the buffers of `place_buffer_when(.., lazy)`
+/// there get their video memory now. Called while the list that uses them is recorded; the
+/// title's queue waits for the tile mappings at its next submit (`before_execute`). An address
+/// outside every such buffer returns without taking the state's lock.
+pub unsafe fn use_range(va: usize, len: usize) {
+    let end = va.saturating_add(len.max(1));
+    let (lo, hi) = (LAZY_BOUNDS[0].load(Ordering::Acquire), LAZY_BOUNDS[1].load(Ordering::Acquire));
+    if va >= hi || end <= lo {
+        return;
+    }
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else { return };
+    let used = s.take_lazy(va, end);
+    if used.is_empty() {
+        return;
+    }
+    for (raw, start, bytes) in used {
+        let ptr = raw as *mut c_void;
+        if let Some(res) = ID3D12Resource::from_raw_borrowed(&ptr).cloned() {
+            s.back_buffer(&res, start, bytes);
+        }
+    }
+    publish_lazy_bounds(s);
+    s.signal();
+}
+
+impl State {
+    /// Placed buffer `res` from tile address `start`, `bytes` long, gets the window's video
+    /// memory at the same addresses; probing the OS commitment keeps uncommitted pages (e.g.
+    /// [start, va) or reserved tails) marked as holes. Its tiles stay pinned while it lives.
+    unsafe fn back_buffer(&mut self, res: &ID3D12Resource, start: usize, bytes: usize) {
+        self.ensure_mapped(start, bytes, |t| query_tile_holes(t));
+        let tiles: Vec<(usize, (u32, u32))> = (start..start + bytes).step_by(TILE).filter_map(|t| self.mapped.get(&t).map(|e| (t, e.pool))).collect();
+        self.map_tiles(res, start, &tiles);
+        for &(_, tile) in &tiles {
+            *self.pinned.entry(tile).or_default() += 1;
+        }
+        self.buffers.insert(res.as_raw() as usize, tiles.iter().map(|x| x.1).collect());
+    }
+
+    /// The buffers waiting for their tiles that overlap `[va, end)`, taken off the list.
+    fn take_lazy(&mut self, va: usize, end: usize) -> Vec<(usize, usize, usize)> {
+        let (used, rest): (Vec<_>, Vec<_>) = self.lazy.iter().partition(|&&(_, start, bytes)| va < start + bytes && start < end);
+        self.lazy = rest;
+        used
+    }
+
+    /// (lowest, highest) address of the buffers waiting for their tiles; (0, 0) when none.
+    fn lazy_bounds(&self) -> (usize, usize) {
+        let lo = self.lazy.iter().map(|b| b.1).min().unwrap_or(0);
+        let hi = self.lazy.iter().map(|b| b.1 + b.2).max().unwrap_or(0);
+        (lo, hi)
+    }
 }
 
 /// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
@@ -2066,8 +2140,12 @@ fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
 fn forget_released(g: &mut Option<State>) {
     let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
+    let lazy = s.lazy.len();
     for res in gone {
         forget_in(s, res);
+    }
+    if s.lazy.len() != lazy {
+        publish_lazy_bounds(s);
     }
 }
 
@@ -2086,6 +2164,7 @@ pub fn forget_buffer(res: usize) {
 }
 
 fn forget_in(s: &mut State, res: usize) {
+    s.lazy.retain(|b| b.0 != res);
     let Some(tiles) = s.buffers.remove(&res) else { return };
     for tile in tiles {
         if let Some(c) = s.pinned.get_mut(&tile) {
@@ -2178,6 +2257,59 @@ mod tests {
         assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
     }
 
+    /// `use_range` is called for every view and root address of a draw: an address outside
+    /// every buffer waiting for its tiles returns without the sparse state's lock.
+    #[test]
+    fn use_range_outside_the_lazy_buffers_does_not_wait_for_the_state() {
+        assert!(returns_while_the_state_is_held(|| unsafe { use_range(0x7ff0_beef_0000, 256) }), "use_range waited for the sparse state's lock");
+    }
+
+    /// A buffer placed lazily has no tiles until an address of it is used; then the window's
+    /// tiles at its addresses, pinned while it lives. One released before its first use leaves
+    /// the list without ever getting tiles.
+    #[test]
+    fn a_lazy_buffer_gets_its_tiles_at_its_first_use() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(4);
+            let make = |s: &State| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                s.dev.CreateReservedResource(&buffer_desc((2 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut r).expect("CreateReservedResource");
+                r.expect("reserved buffer")
+            };
+            let (used, unused) = (make(&s), make(&s));
+            let (used_raw, unused_raw) = (used.as_raw() as usize, unused.as_raw() as usize);
+            // as `place_buffer_when(.., lazy)` leaves them
+            s.lazy.push((used_raw, base + TILE, 2 * TILE));
+            s.lazy.push((unused_raw, base + 3 * TILE, TILE));
+            assert_eq!(s.lazy_bounds(), (base + TILE, base + 4 * TILE));
+
+            assert!(s.take_lazy(base, base + TILE).is_empty(), "the tile before both buffers uses neither");
+            assert!(s.mapped.is_empty() && s.buffers.is_empty());
+
+            let taken = s.take_lazy(base + 2 * TILE + 100, base + 2 * TILE + 104);
+            assert_eq!(taken, vec![(used_raw, base + TILE, 2 * TILE)], "an address in the second tile of the first buffer");
+            s.back_buffer(&used, base + TILE, 2 * TILE);
+            let tiles = s.buffers[&used_raw].clone();
+            assert_eq!(tiles, vec![s.mapped[&(base + TILE)].pool, s.mapped[&(base + 2 * TILE)].pool]);
+            assert!(tiles.iter().all(|t| s.pinned[t] == 1));
+            assert!(!s.mapped.contains_key(&(base + 3 * TILE)), "the other buffer has no tiles yet");
+            assert_eq!(s.lazy_bounds(), (base + 3 * TILE, base + 4 * TILE));
+
+            forget_in(&mut s, unused_raw);
+            assert!(s.lazy.is_empty() && s.lazy_bounds() == (0, 0), "a released lazy buffer leaves the list");
+            assert!(!s.mapped.contains_key(&(base + 3 * TILE)));
+            forget_in(&mut s, used_raw);
+            assert!(tiles.iter().all(|t| !s.pinned.contains_key(t)), "a released buffer unpins its tiles");
+
+            s.wait_for(s.value);
+            drop((used, unused));
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
 
     /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
     /// back, not a new 64 MB heap each time (#913: 288 pools, 18 GB asked of a 12 GB card).
@@ -2224,6 +2356,7 @@ mod tests {
                 quarantined: VecDeque::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
+                lazy: Vec::new(),
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
@@ -2539,6 +2672,7 @@ mod tests {
                 quarantined: VecDeque::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
+                lazy: Vec::new(),
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
@@ -2641,6 +2775,7 @@ mod tests {
                 quarantined: VecDeque::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
+                lazy: Vec::new(),
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
@@ -2771,6 +2906,7 @@ mod tests {
             quarantined: VecDeque::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
+            lazy: Vec::new(),
             to_zero: Vec::new(),
             staging: None,
             ring_write: 0,
