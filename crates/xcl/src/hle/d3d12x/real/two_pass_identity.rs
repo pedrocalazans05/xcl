@@ -3,7 +3,7 @@ use super::{payload_shader, stream_subobjects};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Bump on any change to two-pass cache key fields or ABI root-signature layout to invalidate stale disk entries.
-const TWO_PASS_CACHE_SCHEMA: u32 = 2;
+const TWO_PASS_CACHE_SCHEMA: u32 = 3;
 /// ABI root signature layout tag for two-pass pipelines (`graphics = true`: 6 root UAVs + directly indexed heaps + IA flag).
 const TWO_PASS_ABI_RS_TAG: u32 = 0x5253_0001;
 
@@ -173,10 +173,11 @@ unsafe fn hash_depth_stencil(h: &mut Fnv64, ty: u32, p: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// Canonical cache key `(hash, total_shader_bytes)` for a two-pass mesh/PS pipeline stream,
-/// hashing referenced shader bytecodes and normalized fixed-function state (never pointers or
-/// struct padding). Shader pointers in the stream must refer to live shader bytecode. Returns `None` if an unsupported, duplicate, or unknown subobject is active.
-pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], driver_id: u64, mem_windows: u32) -> Option<(u64, usize)> {
+/// Canonical cache key `(hash, total_shader_bytes)` for a two-pass mesh/VS + PS pipeline stream,
+/// hashing referenced shader bytecodes, `uses_vs` pass-2 mode, and normalized fixed-function state
+/// (never pointers or struct padding). Shader pointers in the stream must refer to live shader
+/// bytecode. Returns `None` if an unsupported, duplicate, or unknown subobject is active.
+pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], driver_id: u64, mem_windows: u32, uses_vs: bool) -> Option<(u64, usize)> {
     let mut subs = stream_subobjects(stream)?;
     let total = subs.iter().map(|(ty, payload)| {
         let (_, align) = super::super::null::subobject_payload(*ty).unwrap();
@@ -192,10 +193,16 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
     let mut h = Fnv64::new();
     h.u32(TWO_PASS_CACHE_SCHEMA);
     h.u32(1); // stream kind
+    h.bool(uses_vs);
     h.u32(TWO_PASS_ABI_RS_TAG);
     h.u32(mem_windows);
     h.u64(driver_id);
     samplers_hash_into(&mut h, ps_samplers);
+    let required_stage = if uses_vs {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS.0 as u32
+    } else {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32
+    };
     let mut shader_bytes = 0usize;
     for (ty, payload) in subs {
         match ty {
@@ -222,7 +229,7 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
             }
             1..=6 | 24 | 25 => {
                 let state = read_state::<D3D12_SHADER_BYTECODE>(payload)?;
-                if state.BytecodeLength == 0 && ty != 25 {
+                if state.BytecodeLength == 0 && ty != required_stage {
                     continue;
                 }
                 let code = payload_shader(payload)?;
@@ -302,12 +309,13 @@ mod tests {
         );
 
         unsafe {
-            let k1 = two_pass_stream_key(&s1.0, &[], 0x1234, 1).unwrap();
-            let k2 = two_pass_stream_key(&s2.0, &[], 0x1234, 1).unwrap();
+            let k1 = two_pass_stream_key(&s1.0, &[], 0x1234, 1, false).unwrap();
+            let k2 = two_pass_stream_key(&s2.0, &[], 0x1234, 1, false).unwrap();
             assert_eq!(k1, k2);
             assert_eq!(k1.1, ms.len() + ps.len());
-            assert_ne!(k1, two_pass_stream_key(&s1.0, &[([1, 2, 3, 4], false)], 0x1234, 1).unwrap());
-            assert_ne!(k1, two_pass_stream_key(&s1.0, &[], 0x5678, 1).unwrap());
+            assert_ne!(k1, two_pass_stream_key(&s1.0, &[([1, 2, 3, 4], false)], 0x1234, 1, false).unwrap());
+            assert_ne!(k1, two_pass_stream_key(&s1.0, &[], 0x5678, 1, false).unwrap());
+            assert_ne!(k1, two_pass_stream_key(&s1.0, &[], 0x1234, 1, true).unwrap());
         }
     }
 
@@ -343,12 +351,12 @@ mod tests {
         s2.raw(depth, &ds_b, false);
 
         unsafe {
-            assert_eq!(two_pass_stream_key(&s1.0, &[], 1, 1), two_pass_stream_key(&s2.0, &[], 1, 1));
+            assert_eq!(two_pass_stream_key(&s1.0, &[], 1, 1, false), two_pass_stream_key(&s2.0, &[], 1, 1, false));
             // Unknown subobject or active pointer subobject returns None safely.
             let mut with_il = StreamOut::default();
             let il = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: 0x1234 as *const _, NumElements: 1 };
             with_il.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &il);
-            assert_eq!(two_pass_stream_key(&with_il.0, &[], 1, 1), None);
+            assert_eq!(two_pass_stream_key(&with_il.0, &[], 1, 1, false), None);
         }
     }
 
@@ -386,12 +394,16 @@ mod tests {
         }
 
         unsafe {
-            let key = two_pass_stream_key(&base.0, &[], 1, 4).expect("base mesh key");
-            assert_eq!(two_pass_stream_key(&with_empty.0, &[], 1, 4), Some(key));
+            let key = two_pass_stream_key(&base.0, &[], 1, 4, false).expect("base mesh key");
+            assert_eq!(two_pass_stream_key(&with_empty.0, &[], 1, 4, false), Some(key));
 
             let mut empty_ms = StreamOut::default();
             empty_ms.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &empty_shader);
-            assert_eq!(two_pass_stream_key(&empty_ms.0, &[], 1, 4), None);
+            assert_eq!(two_pass_stream_key(&empty_ms.0, &[], 1, 4, false), None);
+
+            let mut empty_vs = StreamOut::default();
+            empty_vs.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &empty_shader);
+            assert_eq!(two_pass_stream_key(&empty_vs.0, &[], 1, 4, true), None);
         }
     }
 
@@ -402,16 +414,16 @@ mod tests {
         s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
         s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
         unsafe {
-            assert_ne!(two_pass_stream_key(&s.0, &[], 1, 1), two_pass_stream_key(&s.0, &[], 1, 4 | crate::gpu::recomp::HEAP_WINDOWS));
+            assert_ne!(two_pass_stream_key(&s.0, &[], 1, 1, false), two_pass_stream_key(&s.0, &[], 1, 4 | crate::gpu::recomp::HEAP_WINDOWS, false));
             // Duplicate subobjects fail closed.
             let mut dup = StreamOut(s.0.clone(), s.1);
             dup.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
-            assert_eq!(two_pass_stream_key(&dup.0, &[], 1, 1), None);
+            assert_eq!(two_pass_stream_key(&dup.0, &[], 1, 1, false), None);
             // Invalid NumRenderTargets > 8 fails closed.
             let mut bad_rt = StreamOut::default();
             let rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 9, ..Default::default() };
             bad_rt.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
-            assert_eq!(two_pass_stream_key(&bad_rt.0, &[], 1, 1), None);
+            assert_eq!(two_pass_stream_key(&bad_rt.0, &[], 1, 1, false), None);
         }
         let cs = [10u8; 64];
         assert_ne!(two_pass_cs_key(&cs, &[], 1, 1), two_pass_cs_key(&cs, &[], 1, 4));
@@ -443,10 +455,12 @@ mod tests {
         s_vs.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
 
         unsafe {
-            let k_ms = two_pass_stream_key(&s_ms.0, &[], 1, 1).expect("MS key");
-            let k_vs = two_pass_stream_key(&s_vs.0, &[], 1, 1).expect("VS key");
+            let k_ms = two_pass_stream_key(&s_ms.0, &[], 1, 1, false).expect("MS key");
+            let k_vs = two_pass_stream_key(&s_vs.0, &[], 1, 1, true).expect("VS key");
+            let k_vs_flag_only = two_pass_stream_key(&s_vs.0, &[], 1, 1, false).expect("VS stream with uses_vs=false");
             assert_eq!(k_vs.1, code.len() + ps.len());
             assert_ne!(k_ms.0, k_vs.0, "VS fallback stream must have a distinct key from MS stream");
+            assert_ne!(k_vs.0, k_vs_flag_only.0, "uses_vs flag itself must separate Pass 2 cache keys");
         }
     }
 }

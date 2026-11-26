@@ -6123,7 +6123,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let mesh_bytes = stream.shader_bytes();
     let gkey = (mesh_bytes != 0).then(|| two_pass_driver_id(this)).flatten().and_then(|driver| {
-        two_pass_identity::two_pass_stream_key(&stream.0, ps_samplers, driver, crate::gpu::recomp::pso::mem_windows())
+        two_pass_identity::two_pass_stream_key(&stream.0, ps_samplers, driver, crate::gpu::recomp::pso::mem_windows(), tp.uses_vs)
     });
     let gdisk = gkey.and_then(|(hash, bytes)| driver_cache::graphics_path(hash, bytes));
     let gram = gkey.and_then(graphics_blob);
