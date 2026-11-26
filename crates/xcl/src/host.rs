@@ -8,6 +8,18 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+/// System-wide virtual commit `(used_mb, limit_mb)` via `GlobalMemoryStatusEx`.
+pub(crate) fn system_commit() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return (0, 0);
+    }
+    let used = m.ullTotalPageFile.saturating_sub(m.ullAvailPageFile);
+    (used >> 20, m.ullTotalPageFile >> 20)
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,

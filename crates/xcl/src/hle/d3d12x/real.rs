@@ -5224,13 +5224,28 @@ fn forget_graphics_blob(key: (u64, usize), rejected: &std::sync::Arc<Vec<u8>>) -
     true
 }
 
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() || graphics_blob(key).is_some() {
-        return;
+/// The driver's blob of the graphics pipeline just built, for its caller (the disk cache), and
+/// in memory while `GRAPHICS_BLOBS_MAX` has room (as `remember_compute_blob`: one the store has
+/// no room for must still reach the disk).
+unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) -> Option<std::sync::Arc<Vec<u8>>> {
+    let preparing = PREPARING.load(Ordering::Relaxed);
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !preparing && !driver_cache::keep_fixtures()) || pso.is_null() {
+        return None;
     }
-    if let Some(bytes) = read_pso_cached_blob(pso) {
-        remember_graphics_blob(key, std::sync::Arc::new(bytes));
+    if let Some(b) = graphics_blob(key) {
+        return Some(b);
     }
+    let bytes = read_pso_cached_blob(pso)?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let bytes = std::sync::Arc::new(bytes);
+    // (a preparation worker builds each pipeline once: for the disk only)
+    if preparing {
+        return Some(bytes);
+    }
+    remember_graphics_blob(key, bytes.clone());
+    Some(bytes)
 }
 
 fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
@@ -5246,7 +5261,7 @@ fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
 /// samplers, blend/rasterizer/depth-stencil state, input layout, render target / depth formats,
 /// sample desc, topology, flags) for in-memory and on-disk driver blob caching.
-unsafe fn graphics_blob_key(
+pub(super) unsafe fn graphics_blob_key(
     copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     vs_dxil: &[u8],
     ps_dxil: Option<&[u8]>,
@@ -5653,7 +5668,15 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
-    let disk = driver_cache::graphics_path(gkey.0, gkey.1);
+    let driver = driver_identity(this);
+    let disk = driver.and_then(|id| {
+        let mut h = Fnv64::new();
+        h.u64(gkey.0);
+        h.u64(gkey.1 as u64);
+        h.u64(id);
+        h.u32(crate::gpu::recomp::pso::mem_windows());
+        driver_cache::graphics_path(h.finish(), bytes)
+    });
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -5675,9 +5698,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, build.in_driver);
+        if let Some(b) = keep_graphics_blob(gkey, *ppv, bytes) {
+            if let Some(p) = disk.as_deref() {
+                if PREPARING.load(Ordering::Relaxed) {
+                    driver_cache::write(p, &b);
+                } else {
+                    driver_cache::keep(p, &b, build.in_driver);
+                }
+            }
         }
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
@@ -5810,7 +5838,8 @@ mod shaders_key_tests {
 }
 
 impl OwnedDesc {
-    fn shaders_key(&self) -> u64 {
+    /// The key of its shaders, and each shader's (`shader_key`, in its own order).
+    fn shaders_key(&self) -> (u64, Vec<u64>) {
         let blobs = match self {
             OwnedDesc::Compute(_, b) => b,
             OwnedDesc::Graphics(_, b, ..) => b,
@@ -5819,8 +5848,24 @@ impl OwnedDesc {
         let key = shaders_key(blobs);
         // each shader by itself too: what a title's shader preparation translates before the
         // next run (`pso_async::earlier_used_shaders`)
-        super::pso_async::shaders_of(key, blobs.iter().map(|b| shader_key(b)).collect());
-        key
+        let parts: Vec<u64> = blobs.iter().map(|b| shader_key(b)).collect();
+        super::pso_async::shaders_of(key, parts.clone());
+        (key, parts)
+    }
+
+    /// A graphics pipeline's entry for the next run's preparation (`gfx_records`), of the set
+    /// `key` whose shaders' keys are `parts`; None for any other.
+    unsafe fn record(&self, key: u64, parts: &[u64]) -> Option<Vec<u8>> {
+        let OwnedDesc::Graphics(d, ..) = self else { return None };
+        // (`own_graphics` copied the stages it has, in this order)
+        let mut parts = parts.iter();
+        let mut shaders = [0u64; 5];
+        for (s, b) in shaders.iter_mut().zip([&d.VS, &d.PS, &d.DS, &d.HS, &d.GS]) {
+            if !b.pShaderBytecode.is_null() && b.BytecodeLength != 0 {
+                *s = *parts.next()?;
+            }
+        }
+        Some(super::gfx_records::encode(key, shaders, d))
     }
 
     fn ptr(&self) -> *const c_void {
@@ -6046,7 +6091,9 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let key = owned.shaders_key();
+    let (key, parts) = owned.shaders_key();
+    // (a graphics pipeline used in this run is built before the next starts: `gfx_records`)
+    let described = if super::pso_async::lazy() { owned.record(key, &parts) } else { None };
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let bvh_trav = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::uses_bvh_intersect(b)));
@@ -6070,6 +6117,9 @@ unsafe fn go_background(
     });
     if super::pso_async::lazy() {
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        if let Some(entry) = described {
+            super::pso_async::on_first_use(*ppv as usize, Box::new(move || super::gfx_records::note(entry)));
+        }
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
     }
@@ -6088,6 +6138,33 @@ unsafe fn go_background(
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
+}
+
+/// This process is a shader preparation worker (`prepare_device`): it keeps the driver's blob of
+/// every graphics pipeline it builds on disk, whatever its size and time, and none in memory.
+static PREPARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A shader preparation worker's device (`shaders::graphics_worker`), made on the title's adapter:
+/// adopted as the title's is, so `prepare_graphics` takes the title's path. Raw, kept for the
+/// process.
+pub(crate) fn prepare_device(device: ID3D12Device) -> usize {
+    PREPARING.store(true, Ordering::Relaxed);
+    let raw = device.into_raw();
+    unsafe { adopt(raw, Kind::Device) };
+    raw as usize
+}
+
+/// A title's graphics pipeline `desc` (`gfx_records::Record::desc`) built on `device`
+/// (`prepare_device`) as the title's background build makes it (`build_graphics`): the
+/// translation, DXC and driver blob caches on disk get what the title will ask for. The pipeline
+/// is released; false: not made (noted in the log as the title's would be).
+pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
+    let this = device as *mut c_void;
+    let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let made = matches!(translated_graphics_pso(this, f, desc as *const _ as *const c_void, &pc_iid(Kind::PipelineState), &mut out), Some(hr) if hr >= 0) && !out.is_null();
+    super::pso_async::release(out as usize);
+    made
 }
 
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
@@ -6435,6 +6512,34 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
 
 #[allow(dead_code)] // Consumed by the stacked driver-cache integration.
 mod two_pass_identity;
+use two_pass_identity::Fnv64;
+
+/// The adapter of `device` and its driver (vendor, device, subsystem, revision, user-mode
+/// driver version), for the names of the driver blobs kept on disk: the driver refuses another
+/// one's blob (it is compiled again), and two adapters sharing the cache (a GPU and the
+/// software one) would take turns overwriting each other's files. None: not known (no blob of
+/// its pipelines is kept on disk).
+fn driver_identity(device: *mut c_void) -> Option<u64> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
+    let luid = unsafe { dev.GetAdapterLuid() };
+    let key = (luid.HighPart, luid.LowPart);
+    static IDS: OnceLock<Mutex<HashMap<(i32, u32), Option<u64>>>> = OnceLock::new();
+    let mut ids = IDS.get_or_init(Default::default).lock().unwrap();
+    *ids.entry(key).or_insert_with(|| unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc().ok()?;
+        let version = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok()?;
+        let mut h = Fnv64::new();
+        h.u32(desc.VendorId);
+        h.u32(desc.DeviceId);
+        h.u32(desc.SubSysId);
+        h.u32(desc.Revision);
+        h.u64(version as u64);
+        Some(h.finish())
+    })
+}
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).

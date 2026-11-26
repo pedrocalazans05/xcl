@@ -774,6 +774,13 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
+/// A process that holds no title memory (a shader preparation worker): `get` is None from here
+/// on, and nothing is reserved or committed for it (a run's region commits its coherent window).
+/// Before any `get`.
+pub fn leave_out() {
+    let _ = GLOBAL.set(None);
+}
+
 /// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
 /// known only once it asks for it, and the window is committed when it is made: its size is
 /// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
