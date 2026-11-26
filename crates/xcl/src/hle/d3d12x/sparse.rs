@@ -1170,6 +1170,7 @@ impl State {
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+            super::real::stop_if_device_removed();
         }
     }
 
