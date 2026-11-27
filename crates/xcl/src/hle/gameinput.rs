@@ -622,6 +622,20 @@ impl ReadingHistory {
         let neighbor = if NEXT { index.checked_add(1) } else { index.checked_sub(1) };
         neighbor.and_then(|i| self.readings.get(i)).cloned().ok_or(GAMEINPUT_E_READING_NOT_FOUND)
     }
+
+    fn temporal(&mut self, timestamp: u64, now: u64) -> Result<OwnedReading, HRESULT> {
+        self.prune(now);
+        if now.saturating_sub(timestamp) > HISTORY_US {
+            return Err(GAMEINPUT_E_READING_NOT_FOUND);
+        }
+        if let Some(reading) = self.readings.iter().rev().find(|r| r.reading().timestamp <= timestamp) {
+            return Ok(reading.clone());
+        }
+        if let Some(pred) = self.predecessor.as_ref().filter(|r| r.reading().timestamp <= timestamp) {
+            return Ok(pred.clone());
+        }
+        Err(GAMEINPUT_E_READING_NOT_FOUND)
+    }
 }
 
 // ---- shared methods ----
@@ -716,6 +730,7 @@ fn note_query(what: &str, kind: u32) {
     let what: &'static str = match what {
         "GetCurrentReading" => "GetCurrentReading",
         "GetNext/PreviousReading" => "GetNext/PreviousReading",
+        "GetTemporalReading" => "GetTemporalReading",
         _ => "RegisterReadingCallback",
     };
     let mut g = SEEN.lock().unwrap();
@@ -797,8 +812,41 @@ unsafe fn adjacent_reading<const NEXT: bool>(
     }
 }
 
-unsafe extern "system" fn get_temporal_reading(this: *mut Object, _timestamp: u64, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
-    get_current_reading(this, KIND_GAMEPAD, dev, out)
+unsafe extern "system" fn get_temporal_reading(_this: *mut Object, timestamp: u64, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+    note_query("GetTemporalReading", KIND_GAMEPAD);
+    let started = start_poller();
+    let now = now_us();
+    if !started {
+        let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        if history.record(poll(), now) {
+            READING_READY.notify_one();
+        }
+    }
+    temporal_reading(&HISTORY, timestamp, dev, out, now)
+}
+
+unsafe fn temporal_reading(
+    history: &Mutex<ReadingHistory>,
+    timestamp: u64,
+    dev: *mut c_void,
+    out: *mut *mut Reading,
+    now: u64,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = std::ptr::null_mut();
+    if !ours(dev) {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    let mut history = history.lock().unwrap_or_else(|e| e.into_inner());
+    match history.temporal(timestamp, now) {
+        Ok(reading) => {
+            *out = reading.into_raw();
+            S_OK
+        }
+        Err(hr) => hr,
+    }
 }
 
 static TOKENS: AtomicU64 = AtomicU64::new(0);
@@ -1813,5 +1861,67 @@ mod tests {
         assert!(unsafe { unregister_callback(g, tok_filtered, 0) });
         assert!(unsafe { unregister_callback(g, tok_zero, 0) });
         assert!(unsafe { unregister_callback(g, tok_neg, 0) });
+    }
+
+    #[test]
+    fn temporal_reading_returns_historical_state_for_timestamp() {
+        let history = Mutex::new(ReadingHistory::new());
+        let state1 = GamepadState { buttons: A, ..Default::default() };
+        let state2 = GamepadState { buttons: B, ..Default::default() };
+        {
+            let mut h = history.lock().unwrap();
+            assert!(h.record(state1, 10_000));
+            assert!(h.record(state2, 20_000));
+        }
+        let now = 25_000;
+        let dev = device() as *mut c_void;
+
+        // Query at the first reading's timestamp must return state1, not current state2.
+        let mut out: *mut Reading = std::ptr::null_mut();
+        assert_eq!(unsafe { temporal_reading(&history, 10_000, dev, &mut out, now) }, S_OK);
+        assert!(!out.is_null());
+        unsafe {
+            assert_eq!((*out).state, state1);
+            assert_eq!((*out).timestamp, 10_000);
+            reading_release(out);
+        }
+
+        // Query between state1 and state2 still returns state1.
+        out = std::ptr::null_mut();
+        assert_eq!(unsafe { temporal_reading(&history, 15_000, dev, &mut out, now) }, S_OK);
+        unsafe {
+            assert_eq!((*out).state, state1);
+            reading_release(out);
+        }
+
+        // Query at state2's timestamp returns state2.
+        out = std::ptr::null_mut();
+        assert_eq!(unsafe { temporal_reading(&history, 20_000, dev, &mut out, now) }, S_OK);
+        unsafe {
+            assert_eq!((*out).state, state2);
+            reading_release(out);
+        }
+
+        // Query before any recorded reading fails and clears out pointer.
+        out = 1usize as *mut Reading;
+        assert_eq!(unsafe { temporal_reading(&history, 5_000, dev, &mut out, now) }, GAMEINPUT_E_READING_NOT_FOUND);
+        assert!(out.is_null());
+
+        // Query older than HISTORY_US fails and clears out pointer.
+        let later = 10_000 + HISTORY_US + 10_000;
+        out = 1usize as *mut Reading;
+        assert_eq!(unsafe { temporal_reading(&history, 10_000, dev, &mut out, later) }, GAMEINPUT_E_READING_NOT_FOUND);
+        assert!(out.is_null());
+
+        // Null out pointer returns E_POINTER.
+        assert_eq!(unsafe { temporal_reading(&history, 10_000, dev, std::ptr::null_mut(), now) }, E_POINTER);
+
+        // Foreign device returns GAMEINPUT_E_READING_NOT_FOUND.
+        out = 1usize as *mut Reading;
+        assert_eq!(
+            unsafe { temporal_reading(&history, 10_000, 0x1234 as *mut c_void, &mut out, now) },
+            GAMEINPUT_E_READING_NOT_FOUND
+        );
+        assert!(out.is_null());
     }
 }
