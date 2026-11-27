@@ -2140,6 +2140,21 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 // memory copy / fill / immediate write / timestamp
 // ---------------------------------------------------------------------------------------
 
+/// Resolve a console source address to readable CPU memory: returns `va` directly if mapped
+/// and readable, otherwise checks whether `[va, va + len)` stays fully inside a GPU view of
+/// title CPU memory (`kernelx::mirrors::source_range`) and returns that CPU backing address if
+/// readable.
+fn resolve_readable_source(va: usize, len: usize) -> Option<usize> {
+    if va == 0 || len == 0 {
+        return None;
+    }
+    if crate::gpu::shader::readable(va, len) {
+        return Some(va);
+    }
+    let cpu = crate::hle::kernelx::mirrors::source_range(va, len)?;
+    crate::gpu::shader::readable(cpu, len).then_some(cpu)
+}
+
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2147,12 +2162,34 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    let dst_uma = real::uma_window_buffer(dst as usize, size as usize);
+    let mut src_uma = real::uma_window_buffer(src as usize, size as usize);
+    let mut effective_src = src;
+    if dst_uma.is_some() && src_uma.is_none() {
+        if let Some(src_cpu) = resolve_readable_source(src as usize, size as usize) {
+            let p = super::bind::allocate_upload_memory(this, size as usize, 16);
+            if !p.is_null() {
+                if let Some(staged) = real::uma_window_buffer(p as usize, size as usize) {
+                    std::ptr::copy_nonoverlapping(src_cpu as *const u8, p, size as usize);
+                    src_uma = Some(staged);
+                    effective_src = p as u64;
+                    static STAGED: AtomicU64 = AtomicU64::new(0);
+                    let n = STAGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 4 || n.is_power_of_two() {
+                        crate::xlog_info!(
+                            "D3D12.X: CopyMemoryToMemoryX staged {size:#x} bytes from non-UMA/GPU-view {src:#x} (CPU {src_cpu:#x}) → {dst:#x} (#{n})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let (Some((d, doff)), Some((s, soff))) = (dst_uma, src_uma) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
-    if d == s && dst < src + size && src < dst + size {
+    if d == s && dst < effective_src.saturating_add(size) && effective_src < dst.saturating_add(size) {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
     note_write(this as usize, dst, size);
@@ -3692,14 +3729,15 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
     // a buffer bound before has its mirror: no `readable` (a `VirtualQuery` walk of the title's
     // memory when it is not resident – most of a retail title's render thread at a bind per
     // draw); `sync_title_buffers` checks what it reads
-    if let Some(p) = mirror.then(|| mirrored(va, bytes)).flatten() {
+    if let Some((p, _)) = mirror.then(|| mirrored(va, bytes)).flatten() {
         return pc_va(p as u64);
     }
-    if !crate::gpu::shader::readable(va as usize, bytes) {
+    let Some(src_cpu) = resolve_readable_source(va as usize, bytes) else {
         return t;
-    }
+    };
+    let src_va = src_cpu as u64;
     if mirror {
-        if let Some(p) = mirror_of(va, bytes, what) {
+        if let Some(p) = mirror_of(va, src_va, bytes, what) {
             return pc_va(p as u64);
         }
     }
@@ -3712,42 +3750,64 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         }
         return t;
     }
-    std::ptr::copy_nonoverlapping(va as *const u8, p, bytes);
+    std::ptr::copy_nonoverlapping(src_cpu as *const u8, p, bytes);
     if n < 4 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – bound as a copy made now (#{n})");
     }
     pc_va(p as u64)
 }
 
-/// Ranges of the title's memory with a mirror in unified memory: (start, bytes, mirror). A
-/// title binds one buffer at many offsets (a ring it fills through the frame: a retail title's
-/// views all end at the buffer's end), so a mirror covers a 64 KiB-aligned range and a view
-/// inside a mirrored range uses that mirror at its offset.
-static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+/// Ranges of the title's memory with a mirror in unified memory: (title_start, cpu_src_start,
+/// bytes, mirror). Keying by `title_start` lets repeated binds of a GPU-view address hit
+/// `mirrored(va, bytes)` directly without re-running `VirtualQuery`, while `cpu_src_start` gives
+/// `sync_title_buffers` the readable CPU backing to refresh from.
+static MIRRORS: Mutex<Vec<(u64, u64, usize, usize)>> = Mutex::new(Vec::new());
 /// bytes of mirrors made (never freed)
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Where `[va, va + bytes)` is in a mirror, if it is in one.
-fn mirrored(va: u64, bytes: usize) -> Option<usize> {
-    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+/// Where `[va, va + bytes)` is in a mirror, returning `(uma_mirror_ptr, readable_cpu_src)` if found.
+fn mirrored(va: u64, bytes: usize) -> Option<(usize, u64)> {
+    let end = va.checked_add(bytes as u64)?;
+    MIRRORS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|&&(s, _, l, _)| va >= s && end <= s.saturating_add(l as u64))
+        .map(|&(s, src, _, m)| {
+            let off = va - s;
+            (m + off as usize, src + off)
+        })
 }
 
-/// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
-/// once) the first time.
-unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
-    if let Some(p) = mirrored(va, bytes) {
+/// The mirror address of the title's buffer at `va` (whose readable CPU bytes live at `src_va`);
+/// its range's mirror is made (and filled once) the first time.
+unsafe fn mirror_of(va: u64, src_va: u64, bytes: usize, what: &str) -> Option<usize> {
+    if let Some((p, _)) = mirrored(va, bytes) {
         return Some(p);
     }
     let mut g = MIRRORS.lock().unwrap();
+    let end = va.checked_add(bytes as u64)?;
     // again under the lock: two lists binding one new range at once must share a mirror (a
     // second one would never be synced – every later lookup finds the first)
-    if let Some(&(s, _, m)) = g.iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64) {
+    if let Some(&(s, _, _, m)) = g.iter().find(|&&(s, _, l, _)| va >= s && end <= s.saturating_add(l as u64)) {
         return Some(m + (va - s) as usize);
     }
-    let start = va & !0xffff;
-    let len = ((va + bytes as u64 + 0xffff) & !0xffff) - start;
-    // only as much as is the title's readable memory (the view itself is)
-    let (start, len) = if crate::gpu::shader::readable(start as usize, len as usize) { (start, len as usize) } else { (va, bytes) };
+    let aligned_src = src_va & !0xffff;
+    let aligned_len = ((src_va.saturating_add(bytes as u64).saturating_add(0xffff)) & !0xffff) - aligned_src;
+    let lead = src_va - aligned_src;
+    let aligned_va = va.checked_sub(lead);
+    // only expand to 64 KiB alignment when both the CPU backing is readable and, for GPU views,
+    // the expanded title range stays within the same GPU mirror reservation
+    let can_align = aligned_va.is_some_and(|ava| {
+        crate::gpu::shader::readable(aligned_src as usize, aligned_len as usize)
+            && (ava == aligned_src
+                || crate::hle::kernelx::mirrors::source_range(ava as usize, aligned_len as usize) == Some(aligned_src as usize))
+    });
+    let (key_start, src_start, len) = if can_align {
+        (aligned_va.unwrap(), aligned_src, aligned_len as usize)
+    } else {
+        (va, src_va, bytes)
+    };
     if MIRROR_BYTES.load(Ordering::Relaxed) + len as u64 > 2 << 30 {
         static FULL: AtomicBool = AtomicBool::new(false);
         if !FULL.swap(true, Ordering::Relaxed) {
@@ -3760,13 +3820,13 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         Some((p, _)) => p,
         None => u.alloc(len, 0x1_0000)? as usize,
     };
-    std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
-    g.push((start, len, p));
+    std::ptr::copy_nonoverlapping(src_start as *const u8, p as *mut u8, len);
+    g.push((key_start, src_start, len, p));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
-        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – {start:#x}..{:#x} mirrored at {p:#x}, each draw copies what it reads ({} mirrors, {} MB)", start + len as u64, g.len(), total >> 20);
+        crate::xlog_warn!("D3D12.X: {what} at {va:#x} ({bytes} bytes) is outside unified memory – {key_start:#x}..{:#x} mirrored at {p:#x}, each draw copies what it reads ({} mirrors, {} MB)", key_start + len as u64, g.len(), total >> 20);
     }
-    Some(p + (va - start) as usize)
+    Some(p + (va - key_start) as usize)
 }
 
 /// Before a draw on `list`: the parts of mirrored buffers it reads are copied from the title's
@@ -3780,19 +3840,19 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
         (b.vertex_titles.values().copied().collect::<Vec<_>>(), b.index_title)
     };
-    let mirrors: Vec<Option<usize>> = {
-        let mut v: Vec<Option<usize>> = vbs.iter().map(|&(va, bytes, _)| mirrored(va, bytes as usize)).collect();
+    let mirrors: Vec<Option<(usize, u64)>> = {
+        let mut v: Vec<Option<(usize, u64)>> = vbs.iter().map(|&(va, bytes, _)| mirrored(va, bytes as usize)).collect();
         v.push(ib.and_then(|(va, bytes, _)| mirrored(va, bytes as usize)));
         if v.iter().all(Option::is_none) {
             return;
         }
         v
     };
-    let copy = |va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
+    let copy = |src_va: u64, mirror: usize, bytes: u32, from: u64, len: u64| {
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
-        if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
-            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+        if len > 0 && crate::gpu::shader::readable(src_va as usize + from as usize, len) {
+            std::ptr::copy_nonoverlapping((src_va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
         }
     };
     // the vertices read: [lo, hi)
@@ -3800,14 +3860,17 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         (Some((first, count, base)), Some((va, bytes, format))) => {
             let size: u64 = if format == DXGI_FORMAT_R32_UINT.0 { 4 } else { 2 };
             let (from, len) = (first as u64 * size, count as u64 * size);
-            if let Some(m) = mirrors[vbs.len()] {
-                copy(va, m, bytes, from, len);
-            }
+            let ib_src = if let Some((m, src_va)) = mirrors[vbs.len()] {
+                copy(src_va, m, bytes, from, len);
+                src_va
+            } else {
+                va
+            };
             let n = (len.min((bytes as u64).saturating_sub(from)) / size) as usize;
-            if n == 0 || !crate::gpu::shader::readable((va + from) as usize, n * size as usize) {
+            if n == 0 || !crate::gpu::shader::readable((ib_src + from) as usize, n * size as usize) {
                 (0, u64::MAX)
             } else {
-                let at = (va + from) as *const u8;
+                let at = (ib_src + from) as *const u8;
                 let (mut lo, mut hi) = (u32::MAX, 0u32);
                 for k in 0..n {
                     let i = if size == 4 { at.add(4 * k).cast::<u32>().read_unaligned() } else { at.add(2 * k).cast::<u16>().read_unaligned() as u32 };
@@ -3825,14 +3888,14 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         (Some(_), None) => (0, u64::MAX),
         (None, _) => (first_vertex as u64, first_vertex as u64 + vertices as u64),
     };
-    for (k, &(va, bytes, stride)) in vbs.iter().enumerate() {
-        let Some(m) = mirrors[k] else { continue };
+    for (k, &(_va, bytes, stride)) in vbs.iter().enumerate() {
+        let Some((m, src_va)) = mirrors[k] else { continue };
         // a buffer stepped by instance is not told apart: with instances (callers pass more
         // than 1 for a first instance other than 0 too), all of it
         if instances > 1 || hi == u64::MAX || stride == 0 || hi.saturating_mul(stride as u64) > bytes as u64 {
-            copy(va, m, bytes, 0, bytes as u64);
+            copy(src_va, m, bytes, 0, bytes as u64);
         } else {
-            copy(va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
+            copy(src_va, m, bytes, lo * stride as u64, (hi - lo) * stride as u64);
         }
     }
 }
@@ -4872,6 +4935,38 @@ mod tests {
     fn fill_patterns_repeat_the_value() {
         assert_eq!(pattern(&0x1122_3344u32.to_le_bytes())[..8], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);
         assert_eq!(pattern(&[7u8; 16]), [7u8; 16]);
+    }
+
+    #[test]
+    fn resolve_readable_source_accepts_direct_and_rejects_unmapped() {
+        let buf = [0xA5u8; 64];
+        assert_eq!(resolve_readable_source(0, 64), None);
+        assert_eq!(resolve_readable_source(buf.as_ptr() as usize, 0), None);
+        assert_eq!(resolve_readable_source(buf.as_ptr() as usize, buf.len()), Some(buf.as_ptr() as usize));
+        assert_eq!(resolve_readable_source(0x1000, 64), None);
+
+        // GPU mirror reservation range check: reads inside [gpu, gpu + size) map to CPU backing,
+        // while reads spanning past gpu + size are rejected even if adjacent CPU memory is readable.
+        let backing = vec![0x5Au8; 0x2_0000];
+        let cpu_base = backing.as_ptr() as usize;
+        let gpu_base = 0x7FFF_0000_0000usize;
+        const PAGES_64K: u32 = 0x2040_0000;
+        const GRAPHICS_NOACCESS: u32 = 0x800;
+        crate::hle::kernelx::mirrors::reserved(cpu_base, 0x1_0000, PAGES_64K, 0x04);
+        crate::hle::kernelx::mirrors::reserved(gpu_base, 0x1_0000, PAGES_64K, GRAPHICS_NOACCESS | 0x01);
+        assert_eq!(resolve_readable_source(gpu_base + 0x1000, 0xF000), Some(cpu_base + 0x1000));
+        assert_eq!(resolve_readable_source(gpu_base + 0xF000, 0x2000), None, "span crossing GPU mirror end must be rejected");
+        assert_eq!(resolve_readable_source(gpu_base, usize::MAX), None, "overflowing span must be rejected");
+
+        // Mirror lookup keyed by GPU title VA must hit directly without re-running VirtualQuery
+        // and carry the paired readable CPU source address for sync_title_buffers.
+        {
+            let mut g = MIRRORS.lock().unwrap();
+            g.push((gpu_base as u64, cpu_base as u64, 0x1_0000, 0x9000_0000));
+        }
+        assert_eq!(mirrored(gpu_base as u64 + 0x400, 0x200), Some((0x9000_0400, cpu_base as u64 + 0x400)));
+        assert_eq!(mirrored(gpu_base as u64 + 0xFF00, 0x200), None);
+        MIRRORS.lock().unwrap().retain(|&(s, _, _, _)| s != gpu_base as u64);
     }
 
     #[test]
