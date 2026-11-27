@@ -383,57 +383,6 @@ impl Lw {
         self.exchange_n(&[v])[0]
     }
 
-    /// Split form: `v` of any lane `l` of the console wave (`ds_bpermute`): every lane
-    /// gives its value, 32 words per half.
-    pub fn read_lane_any(&mut self, v: Value, l: Value) -> Value {
-        if !self.split {
-            return self.rla(v, l);
-        }
-        if self.partner == Partner::Spin {
-            let l31 = self.lane31;
-            let src31 = self.andc(l, 31);
-            let other = self.spin_exchange(&[(l31, v)], &[src31])[0];
-            let own = self.s.wave_read_lane_at(v, src31);
-            let lh = self.lshrc(l, 5);
-            let h = self.half;
-            let same = self.cmp(Pred::Eq, lh, h);
-            return self.sel(same, own, other);
-        }
-        if self.partner != Partner::Present {
-            // no partner half: only this half's lanes (the others read 0)
-            let _ = self.exchange_n(&[]);
-            let src31 = self.andc(l, 31);
-            let own = self.s.wave_read_lane_at(v, src31);
-            let lh = self.lshrc(l, 5);
-            let h = self.half;
-            let same = self.cmp(Pred::Eq, lh, h);
-            let z = self.c(0);
-            return self.sel(same, own, z);
-        }
-        let (xs, base) = self.xs_storage();
-        let h = self.half;
-        let mine = self.shlc(h, 5);
-        let mine = self.addc(mine, base);
-        let l31 = self.lane31;
-        let at = self.add(mine, l31);
-        let p = self.s.gs_ptr(xs, at);
-        self.s.m.store(p, v, 4);
-        self.meet();
-        let one = self.c(1);
-        let o = self.xor(h, one);
-        let theirs = self.shlc(o, 5);
-        let theirs = self.addc(theirs, base);
-        let src31 = self.andc(l, 31);
-        let at = self.add(theirs, src31);
-        let q = self.s.gs_ptr(xs, at);
-        let other = self.s.m.load(q, 4);
-        self.meet();
-        let own = self.s.wave_read_lane_at(v, src31);
-        let lh = self.lshrc(l, 5);
-        let same = self.cmp(Pred::Eq, lh, h);
-        self.sel(same, own, other)
-    }
-
     /// The program's ballot of `cond` → (lo, hi) mask words.
     pub fn ballot(&mut self, cond: Value) -> (Value, Value) {
         if self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
