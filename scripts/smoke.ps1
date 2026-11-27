@@ -1,4 +1,4 @@
-# Regression run of a title for a pull request: runs it for a fixed time, reads XCL's log and
+﻿# Regression run of a title for a pull request: runs it for a fixed time, reads XCL's log and
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
@@ -55,20 +55,34 @@ $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $p = New-Object System.Diagnostics.Process
 $p.StartInfo = $psi
-$env:XCL_NETWORK = '0'
-$env:XCL_RUN_SECONDS = "$Seconds"
-$env:XCL_ACTIVITY = '1'
-$null = $p.Start()
-$stdoutTask = $p.StandardOutput.ReadToEndAsync()
-$stderrTask = $p.StandardError.ReadToEndAsync()
-if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
-    if (-not $p.HasExited) { $p.Kill() }
-    $timedOut = $true
+$savedEnv = @{}
+foreach ($name in @('XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_ACTIVITY')) {
+    $item = Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    $savedEnv[$name] = if ($null -ne $item) { $item.Value } else { $null }
 }
-$p.WaitForExit()
-$stdout = $stdoutTask.Result
-$null = $stderrTask.Result
-Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
+try {
+    $env:XCL_NETWORK = '0'
+    $env:XCL_RUN_SECONDS = "$Seconds"
+    $env:XCL_ACTIVITY = '1'
+    $null = $p.Start()
+    $stdoutTask = $p.StandardOutput.ReadToEndAsync()
+    $stderrTask = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
+        if (-not $p.HasExited) { $p.Kill() }
+        $timedOut = $true
+    }
+    $p.WaitForExit()
+    $stdout = $stdoutTask.Result
+    $null = $stderrTask.Result
+} finally {
+    foreach ($name in $savedEnv.Keys) {
+        if ($null -eq $savedEnv[$name]) {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path "Env:$name" -Value $savedEnv[$name]
+        }
+    }
+}
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
