@@ -232,6 +232,21 @@ pub mod mirrors {
             .filter_map(|(&gpu, &(size, cpu))| (cpu_va >= cpu && cpu_va < cpu + size).then(|| gpu + (cpu_va - cpu)))
             .collect()
     }
+
+    /// Like `source`, additionally verifying that the full `[va, va + len)` range stays within
+    /// the GPU mirror reservation so callers never read past the paired CPU view's end.
+    pub fn source_range(va: usize, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let s = STATE.lock().unwrap();
+        let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
+        let off = va - gpu;
+        if off.checked_add(len).is_none_or(|end| end > size) {
+            return None;
+        }
+        cpu.checked_add(off)
+    }
 }
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
