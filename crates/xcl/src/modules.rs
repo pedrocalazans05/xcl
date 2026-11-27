@@ -41,24 +41,46 @@ static MAIN: RwLock<Option<Arc<MappedModule>>> = RwLock::new(None);
 const MAX_RANGES: usize = 512;
 static RANGE_BASE: [AtomicUsize; MAX_RANGES] = [const { AtomicUsize::new(0) }; MAX_RANGES];
 static RANGE_SIZE: [AtomicUsize; MAX_RANGES] = [const { AtomicUsize::new(0) }; MAX_RANGES];
+static RANGE_GEN: [AtomicUsize; MAX_RANGES] = [const { AtomicUsize::new(0) }; MAX_RANGES];
 static RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Update range slot `i` using a per-slot seqlock protocol so lock-free readers never observe
+/// a torn `(base, size)` pair when a freed slot is reused. Caller must hold `MAPPED.write()`.
+fn write_range_slot(i: usize, base: usize, size: usize) {
+    let g = RANGE_GEN[i].load(Ordering::Relaxed);
+    RANGE_GEN[i].store(g.wrapping_add(1), Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    RANGE_SIZE[i].store(size, Ordering::Relaxed);
+    RANGE_BASE[i].store(base, Ordering::Relaxed);
+    RANGE_GEN[i].store(g.wrapping_add(2), Ordering::Release);
+}
+
 pub fn register_mapped(m: Arc<MappedModule>) {
-    let i = RANGE_COUNT.fetch_add(1, Ordering::AcqRel);
-    if i < MAX_RANGES {
-        RANGE_SIZE[i].store(m.size, Ordering::Release);
-        RANGE_BASE[i].store(m.base, Ordering::Release);
+    let mut mapped = MAPPED.write().unwrap();
+    if m.base != 0 {
+        let n = RANGE_COUNT.load(Ordering::Relaxed).min(MAX_RANGES);
+        let slot = (0..n)
+            .find(|&i| RANGE_BASE[i].load(Ordering::Relaxed) == 0)
+            .or_else(|| (n < MAX_RANGES).then_some(n));
+        if let Some(i) = slot {
+            write_range_slot(i, m.base, m.size);
+            if i == n {
+                RANGE_COUNT.store(n + 1, Ordering::Release);
+            }
+        }
     }
-    MAPPED.write().unwrap().push(m);
+    mapped.push(m);
 }
 
 /// The image at `base` failed to load: it is no longer found (by name, base, address), so a
 /// later load maps it again – as Windows' loader unloads a DLL that failed.
 pub fn unregister_mapped(base: usize) {
-    MAPPED.write().unwrap().retain(|m| m.base != base);
-    for i in 0..RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES) {
-        if RANGE_BASE[i].load(Ordering::Acquire) == base {
-            RANGE_BASE[i].store(0, Ordering::Release);
+    let mut mapped = MAPPED.write().unwrap();
+    mapped.retain(|m| m.base != base);
+    let n = RANGE_COUNT.load(Ordering::Relaxed).min(MAX_RANGES);
+    for i in 0..n {
+        if RANGE_BASE[i].load(Ordering::Relaxed) == base {
+            write_range_slot(i, 0, 0);
         }
     }
 }
@@ -67,10 +89,22 @@ pub fn unregister_mapped(base: usize) {
 pub fn image_base_for_addr(addr: usize) -> Option<usize> {
     let n = RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES);
     for i in 0..n {
-        let b = RANGE_BASE[i].load(Ordering::Acquire);
-        let s = RANGE_SIZE[i].load(Ordering::Acquire);
-        if b != 0 && addr >= b && addr < b + s {
-            return Some(b);
+        for _ in 0..16 {
+            let g1 = RANGE_GEN[i].load(Ordering::Acquire);
+            if g1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let b = RANGE_BASE[i].load(Ordering::Relaxed);
+            let s = RANGE_SIZE[i].load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let g2 = RANGE_GEN[i].load(Ordering::Relaxed);
+            if g1 == g2 {
+                if b != 0 && addr >= b && addr < b.saturating_add(s) {
+                    return Some(b);
+                }
+                break;
+            }
         }
     }
     None
@@ -200,6 +234,39 @@ mod tests {
     fn describe_address_takes_arbitrary_stack_words() {
         for addr in [0usize, 1, 0x1000_0000_4, 0x7fff_ffff_ffff, usize::MAX] {
             let _ = describe_address(addr);
+        }
+    }
+
+    #[test]
+    fn register_and_unregister_reuses_slots_beyond_max_ranges() {
+        let size = 0x1000usize;
+        for iter in 0..(MAX_RANGES + 64) {
+            let base = 0x0000_6000_0000_0000usize + iter * 0x1_0000;
+            let module = Arc::new(MappedModule {
+                name: format!("slot_reuse_{iter}.dll"),
+                path: PathBuf::from(format!("slot_reuse_{iter}.dll")),
+                base,
+                size,
+                entry_rva: 0,
+                is_dll: true,
+                exports: OwnedExports::default(),
+                tls_callbacks: Mutex::new(Vec::new()),
+                no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true),
+                stack_reserve: 0,
+            });
+            register_mapped(module);
+            assert_eq!(
+                image_base_for_addr(base + 0x123),
+                Some(base),
+                "module at iteration {iter} must remain visible to lock-free address lookup"
+            );
+            unregister_mapped(base);
+            assert_eq!(
+                image_base_for_addr(base + 0x123),
+                None,
+                "unregistered module at iteration {iter} must no longer match address lookup"
+            );
         }
     }
 }
