@@ -153,14 +153,16 @@ pub fn table() -> Table {
 }
 
 /// The table for `report.json`, falling back to a single snapshot at `seconds` when `note` was
-/// never called (e.g. `XCL_ACTIVITY` was unset). When `allow_dxgi` is false (crash / device
-/// removal report), skips DXGI queries so the report cannot block in a hung driver.
-pub fn table_or_snapshot(allow_dxgi: bool, seconds: f64) -> Table {
+/// never called (e.g. `XCL_ACTIVITY` was unset) and `allow_snapshot` is true. On crash / device
+/// removal reports (`allow_snapshot == false`), stays strictly lock-free (`TABLE.try_lock()` only)
+/// because `snapshot()` acquires D3D12/VRAM mutexes and queries DXGI, which would self-deadlock
+/// if the crashing thread holds one of those locks or the driver is hung.
+pub fn table_or_snapshot(allow_snapshot: bool, seconds: f64) -> Table {
     let t = table();
-    if t.last.is_some() {
+    if t.last.is_some() || !allow_snapshot {
         return t;
     }
-    let s = snapshot_inner(allow_dxgi);
+    let s = snapshot();
     let r = s.record(seconds);
     Table { last: Some(r.clone()), peak_video: Some(r), peak_video_bytes: s.local.map(|g| g.usage) }
 }
@@ -222,19 +224,11 @@ fn census_kind(kind: Kind, non_local: Option<Segment>) -> Kind {
 
 /// Now.
 pub fn snapshot() -> Snapshot {
-    snapshot_inner(true)
-}
-
-fn snapshot_inner(allow_dxgi: bool) -> Snapshot {
     let (pages, page_pools) = super::vram::page_bytes();
     let (arenas, _) = super::vram::arena_bytes();
     let (pools, mapped) = super::sparse::pool_bytes();
     let (_, committed_textures) = super::title_textures::committed_bytes();
-    let (local, non_local) = if allow_dxgi {
-        video_memory().map_or((None, None), |(l, n)| (Some(l), Some(n)))
-    } else {
-        (None, None)
-    };
+    let (local, non_local) = video_memory().map_or((None, None), |(l, n)| (Some(l), Some(n)));
     let uma = crate::gpu::uma::get().map_or(0, |u| u.size() as u64);
     // (what of it D3D12 has imported, which DXGI counts: none if the import failed)
     let imported = super::real::uma_imported_bytes();
@@ -403,15 +397,19 @@ mod tests {
     #[test]
     fn table_or_snapshot_falls_back_when_no_activity_notes_exist() {
         *TABLE.lock().unwrap() = Table::default();
-        // Without XCL_ACTIVITY notes, fallback populates both `last` and `peak_video` safely even with DXGI disabled.
-        let t = table_or_snapshot(false, 42.5);
+        // On crash/device-removed reports (allow_snapshot=false), never acquire locks or query DXGI.
+        let crash_empty = table_or_snapshot(false, 42.5);
+        assert_eq!(crash_empty.last, None);
+        assert_eq!(crash_empty.peak_video, None);
+
+        // On normal exit without XCL_ACTIVITY notes (allow_snapshot=true), fallback populates both `last` and `peak_video`.
+        let t = table_or_snapshot(true, 42.5);
         let last = t.last.as_ref().expect("fallback must populate last");
         assert_eq!(last.seconds, 42.5);
         assert_eq!(t.peak_video.as_ref(), Some(last));
-        assert_eq!(last.video_mb, None, "allow_dxgi=false must skip DXGI video memory query");
         assert!(last.parts.iter().any(|(owner, _, _)| owner == "UMA window"));
 
-        // When a note already exists, table_or_snapshot preserves it without overwriting.
+        // When a note already exists, table_or_snapshot preserves it (even when allow_snapshot=false).
         const M: u64 = 1 << 20;
         let noted = Snapshot {
             commit: Some(1_000 * M),
@@ -420,8 +418,10 @@ mod tests {
             parts: Vec::new(),
         };
         note(&noted, 15.0);
-        let kept = table_or_snapshot(false, 99.0);
-        assert_eq!(kept.last.as_ref().map(|r| (r.seconds, r.video_mb)), Some((15.0, Some(2_000))));
+        let kept_crash = table_or_snapshot(false, 99.0);
+        assert_eq!(kept_crash.last.as_ref().map(|r| (r.seconds, r.video_mb)), Some((15.0, Some(2_000))));
+        let kept_normal = table_or_snapshot(true, 99.0);
+        assert_eq!(kept_normal.last.as_ref().map(|r| (r.seconds, r.video_mb)), Some((15.0, Some(2_000))));
         *TABLE.lock().unwrap() = Table::default();
     }
 }

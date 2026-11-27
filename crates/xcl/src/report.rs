@@ -132,7 +132,7 @@ pub fn build() -> Report {
     let vfs = crate::vfs::get()
         .map(|v| VfsInfo { unmapped_paths: v.unmapped_paths(), redirected_writes: v.redirected_writes(), whiteouts: v.whiteouts() })
         .unwrap_or_default();
-    let is_crash = CRASH.try_lock().ok().is_some_and(|g| g.is_some());
+    let is_crash = CRASH.try_lock().map_or(true, |g| g.is_some());
     Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
