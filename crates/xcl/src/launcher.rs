@@ -358,8 +358,7 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     // repeat is still there to read
     let logs = boot.logs_dir();
     let _ = std::fs::rename(logs.join("xcl.log"), logs.join("xcl.prev.log"));
-    let _ = std::fs::rename(boot.report_path(), logs.join("report.prev.json"));
-    let _ = std::fs::remove_file(boot.report_path());
+    rotate_previous_report(&boot.report_path(), &logs.join("report.prev.json"));
 
     println!("XCL {} – starting '{title}'", env!("CARGO_PKG_VERSION"));
     println!("  exe:   {}", exe.display());
@@ -406,6 +405,13 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     };
     summarize(&boot, code, &environment);
     code as i32
+}
+
+/// Move `report_path` to `prev_report_path`. If renaming fails (for example, because
+/// `prev_report_path` is locked), preserve `report_path` instead of deleting the only copy
+/// of the previous session's report.
+fn rotate_previous_report(report_path: &Path, prev_report_path: &Path) {
+    let _ = std::fs::rename(report_path, prev_report_path);
 }
 
 /// Formats a friendly error message listing the missing console Zen 2 CPU features.
@@ -745,5 +751,28 @@ mod tests {
         assert!(msg.contains("this CPU lacks AVX2, FMA, BMI1, BMI2, POPCNT, SSE4.2, LZCNT"));
         assert!(msg.contains("Zen 2 CPU"));
         assert!(msg.contains("XCL_SKIP_CPU_CHECK=1"));
+    }
+
+    #[test]
+    fn report_rotation_preserves_original_when_destination_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new("rotate_report");
+        let report = dir.0.join("report.json");
+        let prev = dir.0.join("report.prev.json");
+        std::fs::write(&report, r#"{"session":"previous"}"#).unwrap();
+        std::fs::write(&prev, r#"{"session":"older"}"#).unwrap();
+
+        // Hold an exclusive lock on report.prev.json so rename fails.
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&prev).unwrap();
+        rotate_previous_report(&report, &prev);
+        assert!(report.exists(), "original report.json must be preserved when rotation fails");
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), r#"{"session":"previous"}"#);
+
+        // Once unlocked, rotation moves report.json to report.prev.json.
+        drop(lock);
+        rotate_previous_report(&report, &prev);
+        assert!(!report.exists(), "report.json should be moved when rotation succeeds");
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), r#"{"session":"previous"}"#);
     }
 }
