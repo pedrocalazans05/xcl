@@ -325,12 +325,16 @@ pub(super) unsafe fn place(
     let dev_key = dev.as_raw() as usize;
     let key = (va, units);
     let now = Instant::now();
+    let keep_spare = super::vram_pressure::effective_keep_spare_pools(
+        super::vram::keep_spare_pools(),
+        super::vram_pressure::current_ram_band(now),
+    );
 
     let (got, dropped) = {
         let mut g = SMALL_POOLS.lock().unwrap();
         let pools = g.entry(dev_key).or_insert_with(SmallPools::new);
         let got = pools.try_acquire(key, now);
-        let dropped = pools.reclaim_empty_pools(super::vram::keep_spare_pools());
+        let dropped = pools.reclaim_empty_pools(keep_spare);
         (got, dropped)
     };
     log_and_drop_reclaimed(dropped);
@@ -344,7 +348,7 @@ pub(super) unsafe fn place(
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
         };
         let mut new_heap: Option<ID3D12Heap> = None;
-        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&heap_desc, &mut new_heap)) {
+        if let Err(e) = super::title_textures::own_work(|| super::vram_pressure::create_heap_with_backoff(dev, &heap_desc, &mut new_heap)) {
             crate::xlog_warn!("D3D12.X: small texture pool CreateHeap: {e}");
             return None;
         }
@@ -369,7 +373,7 @@ pub(super) unsafe fn place(
             let mut g = SMALL_POOLS.lock().unwrap();
             if let Some(pools) = g.get_mut(&dev_key) {
                 pools.release_key(key, Instant::now(), true);
-                pools.reclaim_empty_pools(super::vram::keep_spare_pools())
+                pools.reclaim_empty_pools(keep_spare)
             } else {
                 Vec::new()
             }
@@ -384,6 +388,7 @@ pub(super) unsafe fn place(
 
 fn log_and_drop_reclaimed(dropped: Vec<ID3D12Heap>) {
     if !dropped.is_empty() {
+        super::vram_pressure::clear_heap_oom_backoff();
         let mb = (dropped.len() * POOL_UNITS as usize * UNIT) >> 20;
         crate::xlog_info!(
             "D3D12.X: reclaimed {} empty 16 MiB small texture pool heap(s) ({mb} MiB returned to GPU)",
@@ -394,12 +399,13 @@ fn log_and_drop_reclaimed(dropped: Vec<ID3D12Heap>) {
 }
 
 /// Sweep expired idle/cooling small-pool blocks for `dev_key` and release any empty heaps
-/// above `XCL_VRAM_KEEP_SPARE_POOLS`, dropping their `ID3D12Heap`s outside `SMALL_POOLS.lock()`.
-pub(super) fn reclaim(dev_key: usize, now: Instant) {
+/// above the effective spare count for `band`, dropping their `ID3D12Heap`s outside `SMALL_POOLS.lock()`.
+pub(super) fn reclaim(dev_key: usize, now: Instant, band: super::vram_pressure::RamBand) {
+    let keep_spare = super::vram_pressure::effective_keep_spare_pools(super::vram::keep_spare_pools(), band);
     let dropped = {
         let mut g = SMALL_POOLS.lock().unwrap();
         let Some(pools) = g.get_mut(&dev_key) else { return };
-        pools.sweep_and_reclaim(now, super::vram::keep_spare_pools())
+        pools.sweep_and_reclaim(now, keep_spare)
     };
     log_and_drop_reclaimed(dropped);
 }
@@ -410,11 +416,15 @@ pub(super) fn forget(resource: usize) -> bool {
     let (found, dropped) = {
         let mut g = SMALL_POOLS.lock().unwrap();
         let now = Instant::now();
+        let keep_spare = super::vram_pressure::effective_keep_spare_pools(
+            super::vram::keep_spare_pools(),
+            super::vram_pressure::current_ram_band(now),
+        );
         let mut found = false;
         let mut dropped = Vec::new();
         for pools in g.values_mut() {
             if pools.forget(resource, now) {
-                dropped = pools.sweep_and_reclaim(now, super::vram::keep_spare_pools());
+                dropped = pools.sweep_and_reclaim(now, keep_spare);
                 found = true;
                 break;
             }
@@ -564,6 +574,34 @@ mod tests {
         assert_eq!((h1, off1), (1, 0));
         assert_eq!(p.pools.len(), 1, "vacated pool slot should be reused");
         assert_eq!(p.bytes(), (4 * UNIT, POOL_UNITS as usize * UNIT));
+    }
+
+    #[test]
+    fn ram_band_pressure_trims_spare_small_pools_aggressively() {
+        use super::super::vram_pressure::{effective_keep_spare_pools, MemorySnapshot, RamBand, RamBandTracker};
+
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p: SmallPools<u32> = SmallPools::new();
+        let (h0, _) = p.add_pool_and_acquire(0, (0x10_0000, 4), at(0));
+        assert_eq!(h0, 0);
+        p.note_resource(1, (0x10_0000, 4));
+        assert!(p.forget(1, at(10)));
+
+        // Sweep idle -> cooling at +2.1s, then advance past COOL (2s) to +4.2s so pool 0 is empty.
+        assert!(p.sweep_and_reclaim(at(2100), 1).is_empty());
+        let mut tracker = RamBandTracker::new();
+        let normal = tracker.update(MemorySnapshot { memory_load_pct: 60, avail_commit_mb: 8192 });
+        assert_eq!(normal, RamBand::Normal);
+        assert!(p.sweep_and_reclaim(at(4200), effective_keep_spare_pools(1, normal)).is_empty());
+        assert_eq!(p.bytes(), (0, POOL_UNITS as usize * UNIT), "Normal band keeps 1 warm spare pool");
+
+        // Under Elevated pressure, effective_keep_spare_pools drops to 0 and reclaims the empty pool.
+        let elevated = tracker.update(MemorySnapshot { memory_load_pct: 84, avail_commit_mb: 8192 });
+        assert_eq!(elevated, RamBand::Elevated);
+        let reclaimed = p.sweep_and_reclaim(at(4200), effective_keep_spare_pools(1, elevated));
+        assert_eq!(reclaimed, vec![0]);
+        assert_eq!(p.bytes(), (0, 0), "Elevated band must reclaim spare empty pool immediately");
     }
 
     #[test]

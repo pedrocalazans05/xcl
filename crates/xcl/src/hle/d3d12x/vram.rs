@@ -158,7 +158,7 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
         Flags: D3D12_HEAP_FLAG_NONE,
     };
     let mut heap: Option<ID3D12Heap> = None;
-    if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
+    if let Err(e) = super::vram_pressure::create_heap_with_backoff(dev, &desc, &mut heap) {
         crate::xlog_warn!("D3D12.X: video-memory arena for {va:#x}: CreateHeap: {e}");
         return None;
     }
@@ -646,7 +646,7 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
         Flags: D3D12_HEAP_FLAG_NONE,
     };
     let mut heap: Option<ID3D12Heap> = None;
-    if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+    if let Err(e) = super::title_textures::own_work(|| super::vram_pressure::create_heap_with_backoff(dev, &desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
     }
@@ -709,7 +709,7 @@ pub(super) fn keep_spare_pools() -> usize {
 }
 
 const POOL_BYTES: u64 = POOL_PAGES as u64 * PAGE as u64;
-const OOM_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+const OOM_BACKOFF: std::time::Duration = super::vram_pressure::OOM_BACKOFF_WINDOW;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdapterBudget { Local(u64), Dedicated(u64) }
@@ -787,7 +787,10 @@ unsafe fn alloc_budgeted_pool(
 ) -> Option<u32> {
     if pools.len() >= max_pools { return None; }
     let (retiring, freed_pool) = poll_retiring_pool_heaps(dev_key);
-    if freed_pool { *oom_until = None; }
+    if freed_pool {
+        *oom_until = None;
+        super::vram_pressure::clear_heap_oom_backoff();
+    }
     if pools.len().saturating_add(retiring) >= max_pools || oom_until.is_some_and(|t| now < t) {
         return None;
     }
@@ -886,12 +889,13 @@ impl Pages {
     }
 
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
-    /// pool heaps (above the warm spare count), returning their `ID3D12Heap`s to be dropped
-    /// outside `PAGES.lock()`.
-    fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
+    /// pool heaps (above the warm spare count for `band`), returning their `ID3D12Heap`s to be
+    /// dropped outside `PAGES.lock()`.
+    fn sweep_and_reclaim(&mut self, now: std::time::Instant, band: super::vram_pressure::RamBand) -> Vec<ID3D12Heap> {
         self.sweep(now);
         self.pool.drain_cooling(now);
-        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
+        let keep_spare = super::vram_pressure::effective_keep_spare_pools(keep_spare_pools(), band);
+        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare, POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
             if let Some(h) = self.pools.take_heap(idx) {
@@ -900,9 +904,10 @@ impl Pages {
         }
         if !dropped.is_empty() {
             self.oom_until = None;
+            super::vram_pressure::clear_heap_oom_backoff();
             let mb = (dropped.len() * POOL_PAGES as usize * PAGE) >> 20;
             crate::xlog_info!(
-                "D3D12.X: reclaimed {} empty 64 MiB VRAM pool heap(s) ({mb} MiB returned to GPU; {} pools active)",
+                "D3D12.X: reclaimed {} empty 64 MiB VRAM pool heap(s) ({mb} MiB returned to GPU; {} pools active; band={band:?})",
                 dropped.len(),
                 self.pools.len()
             );
@@ -1691,8 +1696,11 @@ pub(super) unsafe fn available_tiles(dev_key: usize) -> usize {
     let (retiring, freed_pool) = poll_retiring_pool_heaps(dev_key);
     if freed_pool {
         pages.oom_until = None;
+        super::vram_pressure::clear_heap_oom_backoff();
     }
-    if pages.oom_until.is_some_and(|t| now < t) {
+    if pages.oom_until.is_some_and(|t| now < t)
+        || !super::vram_pressure::allow_speculative_pool_growth(super::vram_pressure::current_ram_band(now))
+    {
         return free;
     }
     let used_pools = pages.pools.len().saturating_add(retiring);
@@ -2103,6 +2111,8 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(dev) = dev else { return };
     let dev_key = dev.as_raw() as usize;
     let now = std::time::Instant::now();
+    let band = super::vram_pressure::current_ram_band(now);
+    let reclaim_every = super::vram_pressure::reclaim_interval(band);
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
@@ -2115,10 +2125,10 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
                 pages.waited.insert(key, pages.value);
             }
-            if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
+            if now.duration_since(pages.last_reclaim) >= reclaim_every {
                 pages.last_reclaim = now;
                 do_reclaim = true;
-                newly_reclaimed = pages.sweep_and_reclaim(now);
+                newly_reclaimed = pages.sweep_and_reclaim(now, band);
                 if !newly_reclaimed.is_empty() {
                     let mut retire = RETIRE.lock().unwrap();
                     let rq = retire.get_or_insert_with(std::collections::HashMap::new)
@@ -2130,7 +2140,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         }
     }
     if do_reclaim {
-        super::vram_small::reclaim(dev_key, now);
+        super::vram_small::reclaim(dev_key, now, band);
     }
     let reclaimed_pools = newly_reclaimed.len();
     #[cfg(test)]
@@ -2823,8 +2833,8 @@ mod tests {
             };
             assert_eq!(remaining_batches, 0);
             assert!(reached, "before_execute did not reclaim the empty pool");
-            assert_eq!(active, cap - 1);
-            assert_eq!(counted, 1, "the reclaimed pool must remain reserved during handoff");
+            assert_eq!(active + counted, cap, "active + retiring pools must equal cap during handoff");
+            assert!(counted >= 1, "reclaimed pool(s) must remain reserved during handoff");
             assert!(replacement.is_none(), "pending retirement pool must not free cap capacity");
         }
     }
