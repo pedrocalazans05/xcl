@@ -65,8 +65,49 @@ exit /b 0
     if ($manifest2.seconds -ne 10) { throw "unexpected seconds: $($manifest2.seconds)" }
     if ($manifest2.title -ne 'MockRun2') { throw "unexpected title: $($manifest2.title)" }
 
+    # Run 3: caller env vars (XCL_NETWORK, XCL_RUN_SECONDS, XCL_ACTIVITY) must be preserved when pre-set
+    $env:XCL_NETWORK = '1'
+    $env:XCL_RUN_SECONDS = '777'
+    $env:XCL_ACTIVITY = '0'
+    $null = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -Title 'EnvPresetOk'
+    if ($env:XCL_NETWORK -ne '1') { throw "XCL_NETWORK mutated after success: $($env:XCL_NETWORK)" }
+    if ($env:XCL_RUN_SECONDS -ne '777') { throw "XCL_RUN_SECONDS mutated after success: $($env:XCL_RUN_SECONDS)" }
+    if ($env:XCL_ACTIVITY -ne '0') { throw "XCL_ACTIVITY mutated after success: $($env:XCL_ACTIVITY)" }
+
+    # Run 4: caller env vars must still be preserved when smoke.ps1 exits with an error
+    $badXcl = Join-Path $fixture 'bad_xcl.cmd'
+    "@echo off`r`necho no log line here`r`nexit /b 1`r`n" | Set-Content -LiteralPath $badXcl -Encoding Ascii
+    $threw = $false
+    try {
+        $null = & $runner -Game $gameDir -Xcl $badXcl -Seconds 5 -Title 'EnvPresetErr'
+    } catch {
+        $threw = $true
+    }
+    if (-not $threw) { throw 'expected smoke.ps1 to throw when XCL prints no Log: line' }
+    if ($env:XCL_NETWORK -ne '1') { throw "XCL_NETWORK mutated after error: $($env:XCL_NETWORK)" }
+    if ($env:XCL_RUN_SECONDS -ne '777') { throw "XCL_RUN_SECONDS mutated after error: $($env:XCL_RUN_SECONDS)" }
+    if ($env:XCL_ACTIVITY -ne '0') { throw "XCL_ACTIVITY mutated after error: $($env:XCL_ACTIVITY)" }
+
+    # Run 5: unset env vars must remain unset after both success and error
+    Remove-Item Env:XCL_NETWORK, Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY -ErrorAction SilentlyContinue
+    $null = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -Title 'EnvUnsetOk'
+    foreach ($name in @('XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_ACTIVITY')) {
+        if (Test-Path "Env:$name") { throw "$name leaked into caller session after success" }
+    }
+    $threw = $false
+    try {
+        $null = & $runner -Game $gameDir -Xcl $badXcl -Seconds 5 -Title 'EnvUnsetErr'
+    } catch {
+        $threw = $true
+    }
+    if (-not $threw) { throw 'expected smoke.ps1 to throw on bad_xcl (unset env)' }
+    foreach ($name in @('XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_ACTIVITY')) {
+        if (Test-Path "Env:$name") { throw "$name leaked into caller session after error" }
+    }
+
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
+    Remove-Item Env:XCL_NETWORK, Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $fixture) {
         Remove-Item -LiteralPath $fixture -Recurse -Force
     }
