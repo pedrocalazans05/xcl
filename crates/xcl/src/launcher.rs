@@ -17,9 +17,9 @@ pub fn data_root() -> PathBuf {
 }
 
 /// Values of `attr` on every `<tag …>` element (so "<Executable" != "<ExecutableList").
+/// Accepts either attribute quote and whitespace around `=`.
 pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
     let open = format!("<{tag}");
-    let key = format!("{attr}=\"");
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(i) = xml[from..].find(&open).map(|i| from + i) {
@@ -28,19 +28,29 @@ pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
         if !(next.is_whitespace() || next == '/' || next == '>') {
             continue;
         }
-        let Some(end) = xml[from..].find('>') else { break };
-        let t = &xml[from..from + end];
-        // attribute must start at a whitespace boundary ("Name=" but not "DisplayName=")
-        let mut pos = 0;
-        while let Some(k) = t[pos..].find(&key).map(|k| pos + k) {
-            if k == 0 || t[..k].ends_with(char::is_whitespace) {
-                let a = k + key.len();
-                if let Some(b) = t[a..].find('"') {
-                    out.push(xml_unescape(&t[a..a + b]));
-                }
-                break;
+        let mut rest = &xml[from..];
+        let mut value = None;
+        loop {
+            rest = rest.trim_start();
+            let Some(end) = rest.find(|c: char| c.is_whitespace() || matches!(c, '=' | '/' | '>')) else { break };
+            let name = &rest[..end];
+            let Some(after_equals) = rest[end..].trim_start().strip_prefix('=') else { break };
+            rest = after_equals.trim_start();
+            let quote = match rest.as_bytes().first() {
+                Some(b'\'') => '\'',
+                Some(b'"') => '"',
+                _ => break,
+            };
+            rest = &rest[1..];
+            let Some(end) = rest.find(quote) else { break };
+            if name == attr && value.is_none() {
+                value = Some(&rest[..end]);
             }
-            pos = k + key.len();
+            rest = &rest[end + 1..];
+        }
+        from = xml.len() - rest.len();
+        if let Some(value) = value {
+            out.push(xml_unescape(value));
         }
     }
     out
@@ -583,6 +593,22 @@ mod tests {
         assert_eq!(xml_unescape("A & B &nbsp; &#xZZ; &"), "A & B &nbsp; &#xZZ; &");
         let xml = r#"<ExecutableList><Executable Name="Q&amp;A.exe" Id="Game"/></ExecutableList>"#;
         assert_eq!(xml_attrs(xml, "Executable", "Name"), ["Q&A.exe"]);
+    }
+
+    #[test]
+    fn game_config_attributes_accept_xml_quotes_and_spacing() {
+        for (tag, xml) in [
+            ("single_quotes", r#"<Game><Identity Name='Contoso.Test'/><Executable Name='a.exe'/><ShellVisuals DefaultDisplayName='A > B'/></Game>"#),
+            ("spaced_equals", r#"<Game><Identity Name = "Contoso.Test"/><Executable Name = "a.exe"/><ShellVisuals DefaultDisplayName = "A > B"/></Game>"#),
+            ("gt_in_prior_attr", r#"<Game><Identity Name="Contoso.Test"/><Executable Note="a>b" Name="a.exe"/><ShellVisuals Description=' DefaultDisplayName="Wrong"' DefaultDisplayName="A > B"/></Game>"#),
+            ("entities_single", r#"<Game><Identity Name='Contoso.Test'/><Executable Name='Bin\Q&amp;A.exe'/><ShellVisuals DefaultDisplayName='A > B'/></Game>"#),
+        ] {
+            let dir = TempDir::new(tag);
+            std::fs::write(dir.0.join("MicrosoftGame.config"), xml).unwrap();
+            let expected_exe = if tag == "entities_single" { r"Bin\Q&A.exe" } else { "a.exe" };
+            assert_eq!(read_game_config(&dir.0), (vec![expected_exe.into()], Some("Contoso.Test".into())), "{tag}");
+            assert_eq!(display_name(&dir.0).as_deref(), Some("A > B"), "{tag}");
+        }
     }
 
     #[test]
