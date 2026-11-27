@@ -807,7 +807,7 @@ type ReadingCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Reading,
 type DeviceCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Object, u64, u32, u32);
 
 enum CallbackKind {
-    Reading { ctx: usize, cb: ReadingCallback, after_sequence: u64 },
+    Reading { ctx: usize, cb: ReadingCallback, after_sequence: u64, threshold: f32 },
     Device,
 }
 
@@ -816,6 +816,26 @@ struct CallbackState {
     stopped: bool,
     in_flight: usize,
     running_threads: Vec<ThreadId>,
+    last_delivered: Option<GamepadState>,
+}
+
+fn exceeds_analog_threshold(prev: &GamepadState, cur: &GamepadState, threshold: f32) -> bool {
+    if threshold <= 0.0 || threshold.is_nan() {
+        return true;
+    }
+    if cur.buttons != prev.buttons {
+        return true;
+    }
+    [
+        (cur.left_trigger - prev.left_trigger).abs(),
+        (cur.right_trigger - prev.right_trigger).abs(),
+        (cur.left_x - prev.left_x).abs(),
+        (cur.left_y - prev.left_y).abs(),
+        (cur.right_x - prev.right_x).abs(),
+        (cur.right_y - prev.right_y).abs(),
+    ]
+    .into_iter()
+    .any(|delta| delta >= threshold)
 }
 
 struct CallbackEntry {
@@ -843,10 +863,14 @@ impl Drop for CallbackGuard<'_> {
 
 impl CallbackEntry {
     fn new(token: u64, kind: CallbackKind) -> Self {
+        Self::new_with_baseline(token, kind, None)
+    }
+
+    fn new_with_baseline(token: u64, kind: CallbackKind, baseline: Option<GamepadState>) -> Self {
         Self {
             token,
             kind,
-            state: Mutex::new(CallbackState::default()),
+            state: Mutex::new(CallbackState { last_delivered: baseline, ..CallbackState::default() }),
             done: Condvar::new(),
         }
     }
@@ -856,6 +880,23 @@ impl CallbackEntry {
         if st.stopped {
             return None;
         }
+        let tid = std::thread::current().id();
+        st.in_flight += 1;
+        st.running_threads.push(tid);
+        Some(CallbackGuard { entry: self, tid })
+    }
+
+    fn try_enter_reading(&self, cur: GamepadState, threshold: f32) -> Option<CallbackGuard<'_>> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.stopped {
+            return None;
+        }
+        if let Some(prev) = st.last_delivered {
+            if !exceeds_analog_threshold(&prev, &cur, threshold) {
+                return None;
+            }
+        }
+        st.last_delivered = Some(cur);
         let tid = std::thread::current().id();
         st.in_flight += 1;
         st.running_threads.push(tid);
@@ -910,7 +951,7 @@ impl CallbackEntry {
 static CALLBACKS: Mutex<Vec<Arc<CallbackEntry>>> = Mutex::new(Vec::new());
 
 /// RegisterReadingCallback(device, kind, analog threshold, context, callback, &token)
-unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _threshold: f32, context: *mut c_void, cb: Option<ReadingCallback>, token: *mut u64) -> HRESULT {
+unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mut c_void, kind: u32, threshold: f32, context: *mut c_void, cb: Option<ReadingCallback>, token: *mut u64) -> HRESULT {
     note_query("RegisterReadingCallback", kind);
     let t = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
     if !token.is_null() {
@@ -920,19 +961,38 @@ unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mu
         start_poller();
         let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
         let after_sequence = history.sequence();
-        track_reading_callback(t, context, cb, after_sequence);
+        let baseline = history.readings.back().map(|r| r.reading().state).unwrap_or_default();
+        track_reading_callback_with_threshold(t, context, cb, after_sequence, threshold, baseline);
         start_reading_dispatcher(after_sequence);
     }
     S_OK
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn track_reading_callback(token: u64, context: *mut c_void, cb: ReadingCallback, after_sequence: u64) {
-    let entry = Arc::new(CallbackEntry::new(token, CallbackKind::Reading { ctx: context as usize, cb, after_sequence }));
+    track_reading_callback_with_threshold(token, context, cb, after_sequence, 0.0, GamepadState::default());
+}
+
+fn track_reading_callback_with_threshold(
+    token: u64,
+    context: *mut c_void,
+    cb: ReadingCallback,
+    after_sequence: u64,
+    threshold: f32,
+    baseline: GamepadState,
+) {
+    let entry = Arc::new(CallbackEntry::new_with_baseline(
+        token,
+        CallbackKind::Reading { ctx: context as usize, cb, after_sequence, threshold },
+        Some(baseline),
+    ));
     CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
 }
 
 fn dispatch_reading_callbacks(reading: &OwnedReading, previous: u64) {
-    let sequence = reading.reading().sequence;
+    let cur_reading = reading.reading();
+    let sequence = cur_reading.sequence;
+    let cur_state = cur_reading.state;
     let cbs: Vec<Arc<CallbackEntry>> = CALLBACKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -941,11 +1001,11 @@ fn dispatch_reading_callbacks(reading: &OwnedReading, previous: u64) {
         .cloned()
         .collect();
     for entry in cbs {
-        let CallbackKind::Reading { ctx, cb, after_sequence } = entry.kind else { continue };
+        let CallbackKind::Reading { ctx, cb, after_sequence, threshold } = entry.kind else { continue };
         if sequence <= after_sequence {
             continue;
         }
-        let Some(_guard) = entry.try_enter() else { continue };
+        let Some(_guard) = entry.try_enter_reading(cur_state, threshold) else { continue };
         let overrun = sequence - previous.max(after_sequence) > 1;
         // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
         // `UnregisterCallback` blocked until `cb` returns, and reading is borrowed
@@ -1693,5 +1753,65 @@ mod tests {
         assert!(unsafe { unregister_callback(g, token, 5_000_000) });
         assert!(gate.finished.load(Ordering::Acquire));
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn analog_threshold_filters_small_axis_deltas_but_allows_large_and_digital() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn count_cb(_token: u64, ctx: *mut c_void, _r: *mut Reading, _overrun: bool) {
+            // SAFETY: caller keeps the AtomicU32 alive until unregister_callback returns.
+            unsafe { &*ctx.cast::<AtomicU32>() }.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let filtered_hits = AtomicU32::new(0);
+        let zero_thresh_hits = AtomicU32::new(0);
+        let neg_thresh_hits = AtomicU32::new(0);
+        let tok_filtered = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+        let tok_zero = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+        let tok_neg = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let baseline = GamepadState::default();
+        track_reading_callback_with_threshold(tok_filtered, (&raw const filtered_hits).cast_mut().cast(), count_cb, 0, 0.25, baseline);
+        track_reading_callback_with_threshold(tok_zero, (&raw const zero_thresh_hits).cast_mut().cast(), count_cb, 0, 0.0, baseline);
+        track_reading_callback_with_threshold(tok_neg, (&raw const neg_thresh_hits).cast_mut().cast(), count_cb, 0, -0.5, baseline);
+
+        let mut seq = 1u64;
+        let mut dispatch_state = |state: GamepadState| {
+            let r = OwnedReading::new(state, seq, now_us());
+            dispatch_reading_callbacks(&r, seq - 1);
+            seq += 1;
+        };
+
+        // Below threshold (0.10 < 0.25): filtered callback stays silent; <= 0.0 callbacks fire.
+        dispatch_state(GamepadState { left_x: 0.10, ..Default::default() });
+        assert_eq!(filtered_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(zero_thresh_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(neg_thresh_hits.load(Ordering::Relaxed), 1);
+
+        // Still below threshold from baseline 0.0 (0.20 < 0.25): filtered callback stays silent.
+        dispatch_state(GamepadState { left_x: 0.20, ..Default::default() });
+        assert_eq!(filtered_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(zero_thresh_hits.load(Ordering::Relaxed), 2);
+
+        // Crosses threshold from baseline 0.0 (0.26 >= 0.25): filtered callback fires & updates baseline to 0.26.
+        dispatch_state(GamepadState { left_x: 0.26, ..Default::default() });
+        assert_eq!(filtered_hits.load(Ordering::Relaxed), 1);
+
+        // Below threshold relative to new baseline 0.26 (|0.40 - 0.26| = 0.14 < 0.25): stays silent.
+        dispatch_state(GamepadState { left_x: 0.40, ..Default::default() });
+        assert_eq!(filtered_hits.load(Ordering::Relaxed), 1);
+
+        // Digital button change always fires even with small analog delta (0.14 < 0.25), updating baseline.
+        dispatch_state(GamepadState { buttons: A, left_x: 0.40, ..Default::default() });
+        assert_eq!(filtered_hits.load(Ordering::Relaxed), 2);
+
+        // Trigger delta >= 0.25 fires.
+        dispatch_state(GamepadState { buttons: A, left_x: 0.40, right_trigger: 0.30, ..Default::default() });
+        assert_eq!(filtered_hits.load(Ordering::Relaxed), 3);
+
+        let g = input();
+        assert!(unsafe { unregister_callback(g, tok_filtered, 0) });
+        assert!(unsafe { unregister_callback(g, tok_zero, 0) });
+        assert!(unsafe { unregister_callback(g, tok_neg, 0) });
     }
 }
