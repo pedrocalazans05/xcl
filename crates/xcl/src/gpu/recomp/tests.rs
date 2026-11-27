@@ -10431,16 +10431,24 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
 }
 
 #[test]
-fn gpu_lds_offset_32k_does_not_alias_zero() {
+fn gpu_lds_oob_reads_zero_and_discards_writes() {
     let code = prog(&[
+        // v0 = 0 (offset 0), v1 = 0x1111_2222
         ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        // v6 = 32764 (last valid word: 8191 * 4), v7 = 0xDEAD_BEEF (sentinel)
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 6), ("DATA0", 7), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        // v2 = 32768 (OOB: word 8192), v3 = 0x3333_4444 (must be discarded)
         ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 2), ("DATA0", 3), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        // OOB atomic must also be discarded and return 0
+        ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 9), ("ADDR", 2), ("DATA0", 3), ("OFFSET0", 0), ("OFFSET1", 0)], None),
         ("S_BARRIER", "ENC_SOPP", &[], None),
+        // Read back offset 0 -> v4, OOB offset 32768 -> v5, sentinel offset 32764 -> v8
         ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 0), ("OFFSET0", 0), ("OFFSET1", 0)], None),
         ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 2), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 8), ("ADDR", 6), ("OFFSET0", 0), ("OFFSET1", 0)], None),
     ]);
     let t = super::translate(&code, &super::Options::default()).unwrap();
-    assert!(t.hlsl.contains("& 16383u"), "HLSL must mask to 64 KiB before clamping: {}", t.hlsl);
+    assert!(t.hlsl.contains("& 16383u"), "HLSL must mask to 64 KiB before bounds-checking: {}", t.hlsl);
     assert!(!t.hlsl.contains("& 8191u"), "HLSL must not wrap 32 KiB offsets with & 8191u: {}", t.hlsl);
 
     if !gpu_ready() {
@@ -10455,13 +10463,19 @@ fn gpu_lds_offset_32k_does_not_alias_zero() {
     for r in &mut st.vgpr {
         r[0] = 0; // byte offset 0
         r[1] = 0x1111_2222;
-        r[2] = 32768; // byte offset 32 KiB
+        r[2] = 32768; // byte offset 32 KiB (OOB)
         r[3] = 0x3333_4444;
+        r[6] = 32764; // last valid LDS word (8191 * 4)
+        r[7] = 0xDEAD_BEEF; // sentinel at lds_top
+        r[5] = 0xCAFE_BABE; // pre-fill to verify OOB read writes 0
+        r[9] = 0xCAFE_BABE; // pre-fill to verify OOB atomic _rtn writes 0
     }
 
     for (tag, dxil) in [("hlsl", &dxil_hlsl), ("direct", &dxil_direct)] {
         let r = runner::run(dxil, &st, &[]).unwrap();
-        assert_eq!(r.vgpr[0][4], 0x1111_2222, "{tag}: LDS offset 0 must not be overwritten by offset 32768");
-        assert_eq!(r.vgpr[0][5], 0x3333_4444, "{tag}: LDS offset 32768 must read back its distinct value");
+        assert_eq!(r.vgpr[0][4], 0x1111_2222, "{tag}: LDS offset 0 must not be overwritten by OOB write");
+        assert_eq!(r.vgpr[0][8], 0xDEAD_BEEF, "{tag}: LDS sentinel at last valid word (32764) must not be overwritten by OOB write/atomic");
+        assert_eq!(r.vgpr[0][5], 0, "{tag}: OOB LDS read at offset 32768 must return 0");
+        assert_eq!(r.vgpr[0][9], 0, "{tag}: OOB LDS atomic _rtn at offset 32768 must return 0");
     }
 }

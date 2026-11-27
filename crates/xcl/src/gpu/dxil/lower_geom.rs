@@ -189,7 +189,6 @@ impl Lw {
         let left = self.sel(room, left, z);
         let n = self.umin(emitted, left);
         let n = self.sel(has, n, z);
-        let lds = self.lds.expect("lds");
         self.counted_loop(n, &mut |lw, k| {
             let vi = lw.add(vb, k);
             let kb = lw.c(vbytes);
@@ -203,8 +202,7 @@ impl Lw {
                 let mut vals = [z; 4];
                 for c in 0..4u32 {
                     let a = lw.addc(src, 16 * r + 4 * c);
-                    let i = lw.lds_index(a);
-                    vals[c as usize] = lw.s.gs_load(lds, i);
+                    vals[c as usize] = lw.lds_ld(a);
                 }
                 let o = lw.addc(dst, 4 * slot as u32);
                 let o = lw.shlc(o, 2);

@@ -2067,26 +2067,33 @@ impl Lw {
 
     // ------------------------------------------------------------ LDS / DS
 
-    /// LDS dword index of byte address `at` (`min((at >> 2) & 16383, lds_top)`).
-    /// Masks to the 64 KiB console LDS address space and clamps to `lds_top` (at most 8191,
-    /// the D3D12 32 KiB `groupshared` limit, or lower when split-wave64 exchange words sit
-    /// at the top) so offsets >= 32 KiB do not wrap around and alias offset 0.
-    pub(super) fn lds_index(&mut self, at: Value) -> Value {
+    /// LDS dword index of byte address `at` (`(at >> 2) & 16383`) and whether it is in bounds
+    /// (`<= lds_top`). Masks to the 64 KiB console LDS address space; out-of-bounds reads return
+    /// 0 and out-of-bounds writes/atomics are discarded without touching `lds[lds_top]`.
+    pub(super) fn lds_index_checked(&mut self, at: Value) -> (Value, Value) {
         let i = self.lshrc(at, 2);
         let i = self.andc(i, 16383);
         let k = self.c(self.lds_top);
-        self.umin(i, k)
+        let ok = self.cmp(Pred::ULe, i, k);
+        (i, ok)
     }
-    fn lds_ld(&mut self, at: Value) -> Value {
-        let i = self.lds_index(at);
+    pub(super) fn lds_ld(&mut self, at: Value) -> Value {
+        let (i, ok) = self.lds_index_checked(at);
+        let k = self.c(self.lds_top);
+        let clamped = self.umin(i, k);
         let g = self.lds.expect("lds");
-        self.s.gs_load(g, i)
+        let v = self.s.gs_load(g, clamped);
+        let z = self.c(0);
+        self.sel(ok, v, z)
     }
     fn lds_st(&mut self, at: Value, v: Value) {
         self.geom_note_store(at);
-        let i = self.lds_index(at);
+        let (i, ok) = self.lds_index_checked(at);
         let g = self.lds.expect("lds");
-        self.s.gs_store(g, i, v);
+        let _ = self.guarded(ok, &mut |lw| {
+            lw.s.gs_store(g, i, v);
+            Ok(())
+        });
     }
 
     pub fn ds(&mut self, d: &Decoded, name: &str) -> LResult<()> {
@@ -2264,15 +2271,27 @@ impl Lw {
             let vd = f("VDST");
             return self.guarded(act, &mut |lw| {
                 let g = lw.lds.expect("lds");
-                let i0 = lw.lds_index(a0);
-                let r0 = lw.s.gs_atomic(RmwOp::Xchg, g, i0, v0);
-                let i1 = lw.lds_index(a1);
-                let r1 = lw.s.gs_atomic(RmwOp::Xchg, g, i1, v1);
                 if rtn {
-                    lw.vset(vd, r0);
-                    lw.vset(vd + 1, r1);
+                    let z = lw.c(0);
+                    lw.vset(vd, z);
+                    lw.vset(vd + 1, z);
                 }
-                Ok(())
+                let (i0, ok0) = lw.lds_index_checked(a0);
+                lw.guarded(ok0, &mut |lw| {
+                    let r0 = lw.s.gs_atomic(RmwOp::Xchg, g, i0, v0);
+                    if rtn {
+                        lw.vset(vd, r0);
+                    }
+                    Ok(())
+                })?;
+                let (i1, ok1) = lw.lds_index_checked(a1);
+                lw.guarded(ok1, &mut |lw| {
+                    let r1 = lw.s.gs_atomic(RmwOp::Xchg, g, i1, v1);
+                    if rtn {
+                        lw.vset(vd + 1, r1);
+                    }
+                    Ok(())
+                })
             });
         }
         let (d0, d1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
@@ -2281,16 +2300,22 @@ impl Lw {
         let vd = f("VDST");
         let mut e = None;
         self.guarded(act, &mut |lw| {
-            let i = lw.lds_index(at);
-            match lw.rmw32(d, &op, At::Lds(i), v, v2) {
-                Ok(o) => {
-                    if rtn {
-                        lw.vset(vd, o);
-                    }
-                }
-                Err(x) => e = Some(x),
+            if rtn {
+                let z = lw.c(0);
+                lw.vset(vd, z);
             }
-            Ok(())
+            let (i, ok) = lw.lds_index_checked(at);
+            lw.guarded(ok, &mut |lw| {
+                match lw.rmw32(d, &op, At::Lds(i), v, v2) {
+                    Ok(o) => {
+                        if rtn {
+                            lw.vset(vd, o);
+                        }
+                    }
+                    Err(x) => e = Some(x),
+                }
+                Ok(())
+            })
         })?;
         match e {
             Some(x) => Err(x),
@@ -2301,15 +2326,17 @@ impl Lw {
     /// `InterlockedAnd(slot, ~(mask << sh)); InterlockedOr(slot, (v & mask) << sh)`
     fn lds_bits_store(&mut self, at: Value, sh: Value, mask: u32, v: Value) -> LResult<()> {
         let g = self.lds.expect("lds");
-        let i = self.lds_index(at);
-        let k = self.c(mask);
-        let m = self.bin(BinOp::Shl, k, sh);
-        let nm = self.not(m);
-        self.s.gs_atomic(RmwOp::And, g, i, nm);
-        let vm = self.andc(v, mask);
-        let vs = self.bin(BinOp::Shl, vm, sh);
-        self.s.gs_atomic(RmwOp::Or, g, i, vs);
-        Ok(())
+        let (i, ok) = self.lds_index_checked(at);
+        self.guarded(ok, &mut |lw| {
+            let k = lw.c(mask);
+            let m = lw.bin(BinOp::Shl, k, sh);
+            let nm = lw.not(m);
+            lw.s.gs_atomic(RmwOp::And, g, i, nm);
+            let vm = lw.andc(v, mask);
+            let vs = lw.bin(BinOp::Shl, vm, sh);
+            lw.s.gs_atomic(RmwOp::Or, g, i, vs);
+            Ok(())
+        })
     }
 
     /// `ds_swizzle_b32`'s source lane of this lane (`emit::swizzle_lane`; the upper
