@@ -64,6 +64,27 @@ exit /b 0
     $manifest2 = Get-Content (Join-Path $outDir1 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($manifest2.seconds -ne 10) { throw "unexpected seconds: $($manifest2.seconds)" }
     if ($manifest2.title -ne 'MockRun2') { throw "unexpected title: $($manifest2.title)" }
+    if ($manifest2.crashes -ne 0) { throw "expected 0 crashes on clean run, got $($manifest2.crashes)" }
+
+    # Run 3: single crash logging both 'unhandled exception' and 'process ends with status' must count as 1
+    @"
+[00:00:01] unhandled exception 0xc0000005 in game.exe+0x1234
+[00:00:01] process ends with status 0xc0000005 (thread 1234); on the stack: game.exe+0x1234
+"@ | Set-Content -LiteralPath $mockLog -Encoding utf8
+    $output3 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir2 -Title 'CrashBothLines'
+    if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 3" }
+    $manifest3 = Get-Content (Join-Path $outDir2 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($manifest3.crashes -ne 1) { throw "expected 1 crash when both exception and exit lines appear, got $($manifest3.crashes)" }
+    $smokeBlock3 = $output3 -join "`n"
+    if ($smokeBlock3 -notmatch 'crashes: 1') { throw "smoke block expected 'crashes: 1', got: $smokeBlock3" }
+
+    # Run 4: abnormal termination without unhandled exception (e.g., abort) still counts as 1
+    @"
+[00:00:02] process ends with status 0x3 (thread 5678); on the stack: ucrtbase.dll+0x100
+"@ | Set-Content -LiteralPath $mockLog -Encoding utf8
+    $null = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir2 -Title 'CrashExitOnly'
+    $manifest4 = Get-Content (Join-Path $outDir2 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($manifest4.crashes -ne 1) { throw "expected 1 crash for abnormal exit alone, got $($manifest4.crashes)" }
 
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
