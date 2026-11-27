@@ -152,6 +152,19 @@ pub fn table() -> Table {
     TABLE.try_lock().map(|t| t.clone()).unwrap_or_default()
 }
 
+/// The table for `report.json`, falling back to a single snapshot at `seconds` when `note` was
+/// never called (e.g. `XCL_ACTIVITY` was unset). When `allow_dxgi` is false (crash / device
+/// removal report), skips DXGI queries so the report cannot block in a hung driver.
+pub fn table_or_snapshot(allow_dxgi: bool, seconds: f64) -> Table {
+    let t = table();
+    if t.last.is_some() {
+        return t;
+    }
+    let s = snapshot_inner(allow_dxgi);
+    let r = s.record(seconds);
+    Table { last: Some(r.clone()), peak_video: Some(r), peak_video_bytes: s.local.map(|g| g.usage) }
+}
+
 /// The process's committed bytes, or None where `PrivateUsage` reads 0 (Wine leaves it so; #1097
 /// and #2362 read the commit there another way).
 fn process_commit() -> Option<u64> {
@@ -209,11 +222,19 @@ fn census_kind(kind: Kind, non_local: Option<Segment>) -> Kind {
 
 /// Now.
 pub fn snapshot() -> Snapshot {
+    snapshot_inner(true)
+}
+
+fn snapshot_inner(allow_dxgi: bool) -> Snapshot {
     let (pages, page_pools) = super::vram::page_bytes();
     let (arenas, _) = super::vram::arena_bytes();
     let (pools, mapped) = super::sparse::pool_bytes();
     let (_, committed_textures) = super::title_textures::committed_bytes();
-    let (local, non_local) = video_memory().map_or((None, None), |(l, n)| (Some(l), Some(n)));
+    let (local, non_local) = if allow_dxgi {
+        video_memory().map_or((None, None), |(l, n)| (Some(l), Some(n)))
+    } else {
+        (None, None)
+    };
     let uma = crate::gpu::uma::get().map_or(0, |u| u.size() as u64);
     // (what of it D3D12 has imported, which DXGI counts: none if the import failed)
     let imported = super::real::uma_imported_bytes();
@@ -376,6 +397,31 @@ mod tests {
         note(&Snapshot { local: None, ..snap(0, 22_000) }, 30.0);
         let t = table();
         assert_eq!(t.peak_video.as_ref().map(|r| (r.seconds, r.video_mb)), Some((20.0, Some(0))));
+        *TABLE.lock().unwrap() = Table::default();
+    }
+
+    #[test]
+    fn table_or_snapshot_falls_back_when_no_activity_notes_exist() {
+        *TABLE.lock().unwrap() = Table::default();
+        // Without XCL_ACTIVITY notes, fallback populates both `last` and `peak_video` safely even with DXGI disabled.
+        let t = table_or_snapshot(false, 42.5);
+        let last = t.last.as_ref().expect("fallback must populate last");
+        assert_eq!(last.seconds, 42.5);
+        assert_eq!(t.peak_video.as_ref(), Some(last));
+        assert_eq!(last.video_mb, None, "allow_dxgi=false must skip DXGI video memory query");
+        assert!(last.parts.iter().any(|(owner, _, _)| owner == "UMA window"));
+
+        // When a note already exists, table_or_snapshot preserves it without overwriting.
+        const M: u64 = 1 << 20;
+        let noted = Snapshot {
+            commit: Some(1_000 * M),
+            local: Some(Segment { usage: 2_000 * M, budget: 8_000 * M }),
+            non_local: Some(Segment { usage: 100 * M, budget: 8_000 * M }),
+            parts: Vec::new(),
+        };
+        note(&noted, 15.0);
+        let kept = table_or_snapshot(false, 99.0);
+        assert_eq!(kept.last.as_ref().map(|r| (r.seconds, r.video_mb)), Some((15.0, Some(2_000))));
         *TABLE.lock().unwrap() = Table::default();
     }
 }

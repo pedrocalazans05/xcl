@@ -132,6 +132,7 @@ pub fn build() -> Report {
     let vfs = crate::vfs::get()
         .map(|v| VfsInfo { unmapped_paths: v.unmapped_paths(), redirected_writes: v.redirected_writes(), whiteouts: v.whiteouts() })
         .unwrap_or_default();
+    let is_crash = CRASH.try_lock().ok().is_some_and(|g| g.is_some());
     Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
@@ -150,7 +151,7 @@ pub fn build() -> Report {
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
         dstorage: crate::hle::dstorage::stats(),
-        memory_by_owner: crate::hle::d3d12x::memory_report::table(),
+        memory_by_owner: crate::hle::d3d12x::memory_report::table_or_snapshot(!is_crash, crate::log::uptime()),
         notes: vec![
             "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
             "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
