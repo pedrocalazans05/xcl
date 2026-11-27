@@ -95,7 +95,9 @@ $lastPresents = ($presents | Select-Object -Last 3) -join ' '
 $commits = [regex]::Matches($text, 'memory: (\d+) MB committed') | ForEach-Object { [int]$_.Groups[1].Value }
 $peak = if ($commits) { ($commits | Measure-Object -Maximum).Maximum } else { 'n/a' }
 $removals = ([regex]::Matches($text, 'device removed')).Count
-$crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
+$unhandledExceptions = ([regex]::Matches($text, 'unhandled exception')).Count
+$abnormalExits = ([regex]::Matches($text, 'process ends with status')).Count
+$crashes = [Math]::Max($unhandledExceptions, $abnormalExits)
 # the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
 $gpu = $null
