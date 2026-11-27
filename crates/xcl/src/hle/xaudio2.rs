@@ -224,6 +224,50 @@ static UNSUPPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SOURCE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+pub fn try_stats() -> (AudioStats, bool) {
+    let mut complete = true;
+    let unsupported_formats = match UNSUPPORTED.try_lock() {
+        Ok(d) => d.clone(),
+        Err(_) => {
+            complete = false;
+            Vec::new()
+        }
+    };
+    let dropped_flags = match DROPPED.try_lock() {
+        Ok(d) => d.clone(),
+        Err(_) => {
+            complete = false;
+            Vec::new()
+        }
+    };
+    (
+        AudioStats {
+            engines: ENGINES.load(Ordering::Relaxed),
+            engine_errors: ENGINE_ERRORS.load(Ordering::Relaxed),
+            mastering_voices: MASTERING.load(Ordering::Relaxed),
+            mastering_retries: MASTERING_RETRIES.load(Ordering::Relaxed),
+            mastering_errors: MASTERING_ERRORS.load(Ordering::Relaxed),
+            source_voices: SOURCE_VOICES.load(Ordering::Relaxed),
+            xma_voices: XMA_VOICES.load(Ordering::Relaxed),
+            xma_buffers_decoded: XMA_BUFFERS_DECODED.load(Ordering::Relaxed),
+            xma_decode_errors: XMA_DECODE_ERRORS.load(Ordering::Relaxed),
+            opus_voices: OPUS_VOICES_CREATED.load(Ordering::Relaxed),
+            opus_buffers_decoded: OPUS_BUFFERS_DECODED.load(Ordering::Relaxed),
+            opus_decode_errors: OPUS_DECODE_ERRORS.load(Ordering::Relaxed),
+            unsupported_formats,
+            silent_voices: SILENT_VOICES.load(Ordering::Relaxed),
+            buffers_silenced: SILENCED.load(Ordering::Relaxed),
+            source_voice_errors: SOURCE_ERRORS.load(Ordering::Relaxed),
+            dropped_flags,
+            xapu_packets_decoded: PCM_PACKETS.load(Ordering::Relaxed),
+            xapu_decode_errors: PCM_PACKET_ERRORS.load(Ordering::Relaxed),
+            xapu_frames: PCM_DECODED_FRAMES.load(Ordering::Relaxed),
+            xapu_nonzero_samples: PCM_NONZERO.load(Ordering::Relaxed),
+        },
+        complete,
+    )
+}
+
 pub fn stats() -> AudioStats {
     AudioStats {
         engines: ENGINES.load(Ordering::Relaxed),

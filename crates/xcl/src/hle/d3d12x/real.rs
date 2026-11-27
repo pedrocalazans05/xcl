@@ -384,6 +384,116 @@ unsafe fn open_uma(device: &ID3D12Device) {
     *UMA_BUFFER.lock().unwrap() = bufs;
 }
 
+pub fn try_stats() -> (D3d12Stats, bool) {
+    let mut complete = true;
+    let classes = match CLASSES.try_lock() {
+        Ok(g) => g
+            .iter()
+            .map(|c| ClassStat { interface: c.iface.name.to_string(), public_methods: c.public, internal_slots: c.scanned - c.public })
+            .collect(),
+        Err(_) => {
+            complete = false;
+            Vec::new()
+        }
+    };
+    let adapter = match ADAPTER.try_lock() {
+        Ok(a) => a.clone(),
+        Err(_) => {
+            complete = false;
+            String::new()
+        }
+    };
+    let unknown_iids = match UNKNOWN_IIDS.try_lock() {
+        Ok(s) => s.iter().cloned().collect(),
+        Err(_) => {
+            complete = false;
+            Vec::new()
+        }
+    };
+    let last_frame_dump = match super::present::try_last_frame_dump() {
+        Some(v) => v,
+        None => {
+            complete = false;
+            None
+        }
+    };
+    let uma_used_kb = match crate::gpu::uma::try_get() {
+        Some(u) => match u.try_used() {
+            Some(used) => (used >> 10) as u64,
+            None => {
+                complete = false;
+                0
+            }
+        },
+        None => 0,
+    };
+    let uma_gpu_va = match UMA_BUFFER.try_lock() {
+        Ok(g) => match g.first().map(|b| b.1).unwrap_or(0) {
+            0 => String::new(),
+            v => format!("{v:#x}"),
+        },
+        Err(_) => {
+            complete = false;
+            String::new()
+        }
+    };
+    let uma_error = match UMA_ERROR.try_lock() {
+        Ok(e) => e.clone(),
+        Err(_) => {
+            complete = false;
+            String::new()
+        }
+    };
+    let uma_import_check = match UMA_IMPORT_CHECK.try_lock() {
+        Ok(e) => e.clone(),
+        Err(_) => {
+            complete = false;
+            String::new()
+        }
+    };
+    let translation_errors = match TRANSLATE_ERRORS.try_lock() {
+        Ok(e) => e.clone(),
+        Err(_) => {
+            complete = false;
+            Vec::new()
+        }
+    };
+    let (background_pipelines, bg_complete) = super::pso_async::try_counts();
+    complete &= bg_complete;
+    let (dxil_cache, cache_complete) = crate::gpu::recomp::dxc::try_cache_stats();
+    complete &= cache_complete;
+    let (presents, boundaries) = super::present::counters();
+    (
+        D3d12Stats {
+            backend: super::try_backend().map(|b| format!("{b:?}").to_lowercase()).unwrap_or_default(),
+            adapter,
+            classes,
+            unknown_iids,
+            fallback_pipelines: FALLBACK_PSO.load(Ordering::Relaxed),
+            failed_pipelines: FAILED_PSO.load(Ordering::Relaxed),
+            fallback_root_signatures: FALLBACK_RS.load(Ordering::Relaxed),
+            presents,
+            frame_boundaries: boundaries,
+            last_frame_dump,
+            uma_mb: crate::gpu::uma::try_get().map(|u| (u.size() >> 20) as u64).unwrap_or(0),
+            uma_used_kb,
+            uma_gpu_va,
+            uma_error,
+            uma_import_check,
+            translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
+            translation_errors,
+            background_pipelines,
+            dxil_cache,
+        },
+        complete,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn lock_classes_for_test() -> impl Drop {
+    CLASSES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn stats() -> D3d12Stats {
     let classes = CLASSES
         .lock()

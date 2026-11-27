@@ -1353,3 +1353,25 @@ pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }
+
+pub fn try_counts() -> ((usize, usize, usize), bool) {
+    let mut complete = true;
+    let pending = match PENDING.try_lock() {
+        Ok(g) => g.as_ref().map_or(0, |m| {
+            m.values()
+                .filter(|p| match p.done.try_lock() {
+                    Ok(done) => !*done,
+                    Err(_) => {
+                        complete = false;
+                        true
+                    }
+                })
+                .count()
+        }),
+        Err(_) => {
+            complete = false;
+            0
+        }
+    };
+    ((BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending), complete)
+}

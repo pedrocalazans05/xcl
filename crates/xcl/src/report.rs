@@ -101,7 +101,14 @@ fn source_label(s: &Source) -> String {
 
 pub fn build() -> Report {
     let boot = crate::state::boot();
-    let records = resolver::records();
+    let mut omitted: Vec<&'static str> = Vec::new();
+    let records = match resolver::try_records() {
+        Some(r) => r,
+        None => {
+            omitted.push("imports");
+            Vec::new()
+        }
+    };
     let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
     let mut stubbed = Vec::new();
     for r in &records {
@@ -114,30 +121,91 @@ pub fn build() -> Report {
             stubbed.push(MissingImport { importer: r.importer.clone(), dll: r.dll.clone(), function: r.function.clone() });
         }
     }
-    let mut called: Vec<StubCall> = crate::stubs::all_stubs()
-        .into_iter()
-        .filter(|s| s.calls.load(Ordering::Relaxed) > 0)
-        .map(|s| StubCall {
-            dll: s.dll.clone(),
-            function: s.name.clone(),
-            calls: s.calls.load(Ordering::Relaxed),
-            first_caller: crate::modules::describe_address(s.first_caller.load(Ordering::Relaxed)),
-        })
-        .collect();
+    let mut called: Vec<StubCall> = match crate::stubs::try_all_stubs() {
+        Some(all) => all
+            .into_iter()
+            .filter(|s| s.calls.load(Ordering::Relaxed) > 0)
+            .map(|s| StubCall {
+                dll: s.dll.clone(),
+                function: s.name.clone(),
+                calls: s.calls.load(Ordering::Relaxed),
+                first_caller: crate::modules::describe_address(s.first_caller.load(Ordering::Relaxed)),
+            })
+            .collect(),
+        None => {
+            omitted.push("called_stubs");
+            Vec::new()
+        }
+    };
     called.sort_by(|a, b| b.calls.cmp(&a.calls));
-    let modules = crate::modules::mapped_modules()
-        .iter()
-        .map(|m| ModuleInfo { name: m.name.clone(), base: format!("{:#x}", m.base), size: format!("{:#x}", m.size) })
-        .collect();
-    let vfs = crate::vfs::get()
-        .map(|v| VfsInfo { unmapped_paths: v.unmapped_paths(), redirected_writes: v.redirected_writes(), whiteouts: v.whiteouts() })
-        .unwrap_or_default();
-    let is_crash = CRASH.try_lock().map_or(true, |g| g.is_some());
+    let modules = match crate::modules::try_mapped_modules() {
+        Some(ms) => ms
+            .iter()
+            .map(|m| ModuleInfo { name: m.name.clone(), base: format!("{:#x}", m.base), size: format!("{:#x}", m.size) })
+            .collect(),
+        None => {
+            omitted.push("modules");
+            Vec::new()
+        }
+    };
+    let vfs = match crate::vfs::get() {
+        Some(v) => {
+            let mut vfs_partial = false;
+            let unmapped_paths = v.try_unmapped_paths().unwrap_or_else(|| {
+                vfs_partial = true;
+                Vec::new()
+            });
+            let redirected_writes = v.try_redirected_writes().unwrap_or_else(|| {
+                vfs_partial = true;
+                Vec::new()
+            });
+            let whiteouts = v.try_whiteouts().unwrap_or_else(|| {
+                vfs_partial = true;
+                Vec::new()
+            });
+            if vfs_partial {
+                omitted.push("vfs");
+            }
+            VfsInfo { unmapped_paths, redirected_writes, whiteouts }
+        }
+        None => VfsInfo::default(),
+    };
+    let (is_crash, crash) = match CRASH.try_lock() {
+        Ok(g) => (g.is_some(), g.clone()),
+        Err(_) => {
+            omitted.push("crash");
+            (true, None)
+        }
+    };
+    let (shaders, shaders_ok) = crate::gpu::shader::try_stats();
+    if !shaders_ok {
+        omitted.push("shaders");
+    }
+    let (d3d12, d3d12_ok) = crate::hle::d3d12x::real::try_stats();
+    if !d3d12_ok {
+        omitted.push("d3d12");
+    }
+    let (audio, audio_ok) = crate::hle::xaudio2::try_stats();
+    if !audio_ok {
+        omitted.push("audio");
+    }
+    let (xgameruntime, xgr_ok) = crate::hle::xgameruntime::api::try_stats();
+    if !xgr_ok {
+        omitted.push("xgameruntime");
+    }
+    let mut notes = vec![
+        "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
+        "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
+        "Direct Nt* calls on files do not go through the VFS.".into(),
+    ];
+    if !omitted.is_empty() {
+        notes.push(format!("Partial report: omitted locked sections ({})", omitted.join(", ")));
+    }
     Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
-        crash: CRASH.lock().ok().and_then(|g| g.clone()),
+        crash,
         exit_code: None,
         environment: Vec::new(),
         imports_by_source: by_source,
@@ -145,18 +213,14 @@ pub fn build() -> Report {
         called_stubs: called,
         modules,
         vfs,
-        shaders: crate::gpu::shader::stats(),
+        shaders,
         dxc: crate::gpu::recomp::dxc::toolchain(),
-        d3d12: crate::hle::d3d12x::real::stats(),
-        audio: crate::hle::xaudio2::stats(),
-        xgameruntime: crate::hle::xgameruntime::api::stats(),
+        d3d12,
+        audio,
+        xgameruntime,
         dstorage: crate::hle::dstorage::stats(),
-        memory_by_owner: crate::hle::d3d12x::memory_report::table_or_snapshot(!is_crash, crate::log::uptime()),
-        notes: vec![
-            "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
-            "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
-            "Direct Nt* calls on files do not go through the VFS.".into(),
-        ],
+        memory_by_owner: crate::hle::d3d12x::memory_report::table_or_snapshot(!is_crash && omitted.is_empty(), crate::log::uptime()),
+        notes,
     }
 }
 
@@ -178,10 +242,11 @@ pub fn write_final(crash: Option<String>) {
     // the process ends: a cursor held in the XCL window is let go
     crate::hle::kbm::release();
     // `XCL_DIRECT_DXIL_STATS=1`: the direct DXIL translator's live fallback summary
-    crate::gpu::dxil::coverage::dump_fallbacks();
+    crate::gpu::dxil::coverage::try_dump_fallbacks();
     // a crash is kept even while another thread writes the report, and is written once that
     // thread is done – the process ends right after (#106); other calls give way at once
     let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };
+    let crash_fallback = crash.clone();
     if let Some(c) = crash {
         if let Some(mut g) = lock_within(&CRASH, wait) {
             g.get_or_insert(c);
@@ -189,7 +254,10 @@ pub fn write_final(crash: Option<String>) {
     }
     let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
     let Some(boot) = crate::state::boot() else { return };
-    let r = build();
+    let mut r = build();
+    if r.crash.is_none() {
+        r.crash = crash_fallback;
+    }
     if let Ok(s) = serde_json::to_string_pretty(&r) {
         let _ = std::fs::write(boot.report_path(), s);
     }
@@ -217,5 +285,45 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(CRASH.lock().unwrap().as_deref(), Some("boom"));
         *CRASH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn build_completes_promptly_with_partial_output_when_locks_are_held() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _classes = crate::hle::d3d12x::real::lock_classes_for_test();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+
+        let t0 = Instant::now();
+        let r = build();
+        let elapsed = t0.elapsed();
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        assert!(elapsed < Duration::from_secs(1), "build() took too long ({elapsed:?}) while CLASSES was held");
+        assert!(r.d3d12.classes.is_empty());
+        assert!(
+            r.notes.iter().any(|n| n.contains("Partial report") && n.contains("d3d12")),
+            "expected partial report note mentioning d3d12, got {:?}",
+            r.notes
+        );
+
+        // Even if the crashing thread itself holds CRASH or DXC cache errors, build() must not deadlock.
+        let _crash_guard = CRASH.lock().unwrap();
+        let _dxc_guard = crate::gpu::recomp::dxc::lock_cache_errors_for_test();
+        let t1 = Instant::now();
+        let r2 = build();
+        assert!(t1.elapsed() < Duration::from_secs(1));
+        assert!(r2.crash.is_none());
+        assert!(
+            r2.notes.iter().any(|n| n.contains("Partial report") && n.contains("crash") && n.contains("d3d12")),
+            "expected partial report note mentioning crash and d3d12, got {:?}",
+            r2.notes
+        );
     }
 }

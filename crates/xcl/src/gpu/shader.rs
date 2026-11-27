@@ -430,6 +430,19 @@ pub fn stats() -> ShaderStats {
     s
 }
 
+pub fn try_stats() -> (ShaderStats, bool) {
+    let g = STATE.try_lock().ok();
+    let complete = g.is_some();
+    let mut s = g.as_ref().and_then(|g| g.as_ref().map(|st| st.stats.clone())).unwrap_or_default();
+    if let Some(st) = g.as_ref().and_then(|g| g.as_ref()) {
+        s.rdna2_instructions = st.insts.instructions;
+        s.rdna2_undecoded_dwords = st.insts.undecoded;
+        s.rdna2_mnemonics = st.insts.sorted();
+    }
+    s.dump_dir = dump_dir().to_string_lossy().into_owned();
+    (s, complete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

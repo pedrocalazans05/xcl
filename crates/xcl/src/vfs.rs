@@ -690,14 +690,30 @@ impl Vfs {
         self.unmapped.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
     }
 
+    pub fn try_unmapped_paths(&self) -> Option<Vec<String>> {
+        self.unmapped.try_lock().ok().map(|g| g.iter().cloned().collect())
+    }
+
     pub fn redirected_writes(&self) -> Vec<String> {
         self.writes.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    pub fn try_redirected_writes(&self) -> Option<Vec<String>> {
+        self.writes.try_lock().ok().map(|g| g.iter().cloned().collect())
     }
 
     pub fn whiteouts(&self) -> Vec<String> {
         let mut v: Vec<String> = self.whiteouts.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default();
         v.sort();
         v
+    }
+
+    pub fn try_whiteouts(&self) -> Option<Vec<String>> {
+        self.whiteouts.try_lock().ok().map(|g| {
+            let mut v: Vec<String> = g.iter().cloned().collect();
+            v.sort();
+            v
+        })
     }
 }
 

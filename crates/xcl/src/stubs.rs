@@ -159,6 +159,10 @@ pub fn all_stubs() -> Vec<&'static StubInfo> {
     ALL.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
+pub fn try_all_stubs() -> Option<Vec<&'static StubInfo>> {
+    ALL.try_lock().ok().map(|v| v.clone())
+}
+
 // ---------------------------------------------------------------------------------------
 // Stub database: default return values + ordinal names
 // ---------------------------------------------------------------------------------------

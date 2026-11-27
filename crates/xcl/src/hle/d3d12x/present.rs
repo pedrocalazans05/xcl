@@ -1375,6 +1375,10 @@ pub fn last_frame_dump() -> Option<FrameDumpSample> {
     LAST_FRAME_DUMP.lock().ok().and_then(|s| *s)
 }
 
+pub fn try_last_frame_dump() -> Option<Option<FrameDumpSample>> {
+    LAST_FRAME_DUMP.try_lock().ok().map(|s| *s)
+}
+
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
 unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let dev: ID3D12Device = {

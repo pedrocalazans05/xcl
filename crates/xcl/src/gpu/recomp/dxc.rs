@@ -747,6 +747,25 @@ impl CacheCounters {
         }
     }
 
+    fn try_snapshot(&self) -> (CacheStats, bool) {
+        let (compilation_errors, complete) = match self.compilation_errors.try_lock() {
+            Ok(g) => (g.clone(), true),
+            Err(_) => (Vec::new(), false),
+        };
+        (
+            CacheStats {
+                hits: self.hits.load(Ordering::Relaxed),
+                misses: self.misses.load(Ordering::Relaxed),
+                coalesced_hits: self.coalesced_hits.load(Ordering::Relaxed),
+                deferred_misses: self.deferred_misses.load(Ordering::Relaxed),
+                compilations: self.compilations.load(Ordering::Relaxed),
+                compilation_failures: self.compilation_failures.load(Ordering::Relaxed),
+                compilation_errors,
+            },
+            complete,
+        )
+    }
+
     fn failure(&self, error: String) -> String {
         self.compilation_failures.fetch_add(1, Ordering::Relaxed);
         let mut errors = self.compilation_errors.lock().unwrap();
@@ -757,13 +776,26 @@ impl CacheCounters {
     }
 }
 
+static COUNTERS: OnceLock<CacheCounters> = OnceLock::new();
+
 fn cache_counters() -> &'static CacheCounters {
-    static COUNTERS: OnceLock<CacheCounters> = OnceLock::new();
     COUNTERS.get_or_init(CacheCounters::default)
 }
 
 pub fn cache_stats() -> CacheStats {
     cache_counters().snapshot()
+}
+
+pub fn try_cache_stats() -> (CacheStats, bool) {
+    match COUNTERS.get() {
+        Some(c) => c.try_snapshot(),
+        None => (CacheStats::default(), true),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_cache_errors_for_test() -> impl Drop {
+    cache_counters().compilation_errors.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(super) fn note_memory_hit() {

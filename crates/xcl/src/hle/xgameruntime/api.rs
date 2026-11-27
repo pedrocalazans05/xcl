@@ -1396,6 +1396,25 @@ pub struct ApiStats {
     pub unimplemented: BTreeMap<String, u64>,
 }
 
+pub fn try_stats() -> (ApiStats, bool) {
+    let mut complete = true;
+    let apis = match SEEN.try_lock() {
+        Ok(g) => g.clone(),
+        Err(_) => {
+            complete = false;
+            BTreeMap::new()
+        }
+    };
+    let unimplemented = match UNIMPLEMENTED.try_lock() {
+        Ok(g) => g.clone(),
+        Err(_) => {
+            complete = false;
+            BTreeMap::new()
+        }
+    };
+    (ApiStats { apis, unimplemented }, complete)
+}
+
 pub fn stats() -> ApiStats {
     ApiStats { apis: SEEN.lock().unwrap().clone(), unimplemented: UNIMPLEMENTED.lock().unwrap().clone() }
 }
