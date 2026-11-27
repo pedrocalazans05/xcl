@@ -4572,26 +4572,26 @@ impl Em {
             return Err("GDS");
         }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
+        let top = if self.x64() {
+            "XCL_X_LDS_TOP"
+        } else if self.safe_barrier {
+            "XCL_LDS_TOP"
+        } else {
+            "8191u"
+        };
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
-            let slot = if self.x64() {
-                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_X_LDS_TOP)]")
-            } else if self.safe_barrier {
-                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_LDS_TOP)]")
-            } else {
-                format!("xcl_lds[min((({at}) >> 2) & 16383u, 8191u)]")
-            };
             if name == "ds_write_addtid_b32" {
                 let src = self.vreg(f("DATA0"));
-                self.line(&format!("if ({act}) {{ {slot} = {src}; }}"));
+                self.line(&format!("if ({act}) {{ uint {t}_i = (({at}) >> 2) & 16383u; if ({t}_i <= {top}) xcl_lds[{t}_i] = {src}; }}"));
                 if gs_phase {
                     self.line(&format!("if ({act}) xcl_gs_base = min(xcl_gs_base, {at});"));
                 }
             } else {
                 let dst = self.vreg(f("VDST"));
-                self.line(&format!("if ({act}) {{ {dst} = {slot}; }}"));
+                self.line(&format!("if ({act}) {{ uint {t}_i = (({at}) >> 2) & 16383u; {dst} = ({t}_i <= {top}) ? xcl_lds[min({t}_i, {top})] : 0u; }}"));
             }
             return Ok(());
         }
@@ -4600,18 +4600,6 @@ impl Em {
         let addr = self.vreg(f("ADDR"));
         let a = format!("{t}_ad");
         self.line(&format!("uint {a} = {addr};"));
-        // split wave64 / safe_barrier: runtime state lives in the top of the LDS block
-        let x64 = self.x64();
-        let safe_bar = self.safe_barrier;
-        let lds = |at: String| {
-            if x64 {
-                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_X_LDS_TOP)]")
-            } else if safe_bar {
-                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_LDS_TOP)]")
-            } else {
-                format!("xcl_lds[min((({at}) >> 2) & 16383u, 8191u)]")
-            }
-        };
         let mut st = Vec::new();
         let rw = |n: &str| -> Option<(bool, u64, u64, bool)> {
             // (write?, dwords per element, stride of offsets (bytes), two elements?)
@@ -4638,16 +4626,20 @@ impl Em {
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
             let at = format!("{a} + {off16}u");
-            let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
             let mask = (1u64 << bits) - 1;
             if write {
                 let v = d16_data(&self.vreg(f("DATA0")), half);
-                self.line(&format!("if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"));
+                self.line(&format!(
+                    "if ({act}) {{ uint {t}_i = (({at}) >> 2) & 16383u; if ({t}_i <= {top}) {{ InterlockedAnd(xcl_lds[{t}_i], ~({mask}u << {sh})); InterlockedOr(xcl_lds[{t}_i], ({v} & {mask}u) << {sh}); }} }}"
+                ));
             } else {
                 let v = self.vreg(f("VDST"));
-                let raw = format!("({slot} >> {sh})");
-                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, bits / 8, signed, half)));
+                let raw = format!("((({t}_i <= {top}) ? xcl_lds[min({t}_i, {top})] : 0u) >> {sh})");
+                self.line(&format!(
+                    "if ({act}) {{ uint {t}_i = (({at}) >> 2) & 16383u; {v} = {}; }}",
+                    d16_merge(&v, &raw, bits / 8, signed, half)
+                ));
             }
             return Ok(());
         }
@@ -4663,22 +4655,22 @@ impl Em {
         };
         if let Some((bits, signed, write)) = small {
             let at = format!("{a} + {off16}u");
-            let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
             let mask = (1u64 << bits) - 1;
             if write {
                 let v = self.vreg(f("DATA0"));
                 self.line(&format!(
-                    "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"
+                    "if ({act}) {{ uint {t}_i = (({at}) >> 2) & 16383u; if ({t}_i <= {top}) {{ InterlockedAnd(xcl_lds[{t}_i], ~({mask}u << {sh})); InterlockedOr(xcl_lds[{t}_i], ({v} & {mask}u) << {sh}); }} }}"
                 ));
             } else {
                 let v = self.vreg(f("VDST"));
+                let word = format!("(({t}_i <= {top}) ? xcl_lds[min({t}_i, {top})] : 0u)");
                 let val = if signed {
-                    format!("(uint)(((int)((({slot} >> {sh}) & {mask}u) << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                    format!("(uint)(((int)((({word} >> {sh}) & {mask}u) << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
-                    format!("(({slot} >> {sh}) & {mask}u)")
+                    format!("(({word} >> {sh}) & {mask}u)")
                 };
-                self.line(&format!("if ({act}) {v} = {val};"));
+                self.line(&format!("if ({act}) {{ uint {t}_i = (({at}) >> 2) & 16383u; {v} = {val}; }}"));
             }
             return Ok(());
         }
@@ -4691,13 +4683,14 @@ impl Em {
             let (vd, d0, d1) = (f("VDST"), f("DATA0"), f("DATA1"));
             for (e, at) in addrs.iter().enumerate() {
                 for k in 0..n {
-                    let slot = lds(format!("{at} + {}u", 4 * k));
+                    let iv = format!("{t}_i_{e}_{k}");
+                    let ie = format!("((({at} + {}u) >> 2) & 16383u)", 4 * k);
                     if write {
                         let src = self.vreg(if e == 0 { d0 } else { d1 } + k);
-                        st.push(format!("{slot} = {src};"));
+                        st.push(format!("uint {iv} = {ie}; if ({iv} <= {top}) xcl_lds[{iv}] = {src};"));
                     } else {
                         let v = self.vreg(vd + e as u64 * n + k);
-                        st.push(format!("{v} = {slot};"));
+                        st.push(format!("uint {iv} = {ie}; {v} = ({iv} <= {top}) ? xcl_lds[min({iv}, {top})] : 0u;"));
                     }
                 }
             }
@@ -4716,9 +4709,12 @@ impl Em {
         // two exchanges (ds_wrxchg2(st64)_rtn_b32): old values to VDST, VDST + 1
         if op == "wrxchg2_b32" || op == "wrxchg2st64_b32" {
             let stride = if op == "wrxchg2_b32" { 4 } else { 256 };
-            let (s0, s1) = (lds(format!("{a} + {}u", o0 * stride)), lds(format!("{a} + {}u", o1 * stride)));
+            let i0 = format!("((({a} + {}u) >> 2) & 16383u)", o0 * stride);
+            let i1 = format!("((({a} + {}u) >> 2) & 16383u)", o1 * stride);
             let (v0, v1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
-            self.line(&format!("uint {t}_o0 = 0u, {t}_o1 = 0u; if ({act}) {{ InterlockedExchange({s0}, {v0}, {t}_o0); InterlockedExchange({s1}, {v1}, {t}_o1); }}"));
+            self.line(&format!(
+                "uint {t}_o0 = 0u, {t}_o1 = 0u; if ({act}) {{ uint {t}_i0 = {i0}; if ({t}_i0 <= {top}) InterlockedExchange(xcl_lds[{t}_i0], {v0}, {t}_o0); uint {t}_i1 = {i1}; if ({t}_i1 <= {top}) InterlockedExchange(xcl_lds[{t}_i1], {v1}, {t}_o1); }}"
+            ));
             if rtn {
                 let (r0, r1) = (self.vreg(f("VDST")), self.vreg(f("VDST") + 1));
                 self.line(&format!("if ({act}) {{ {r0} = {t}_o0; {r1} = {t}_o1; }}"));
@@ -4728,9 +4724,11 @@ impl Em {
         // operands: cmpst = (compare DATA0, new DATA1), mskor = (mask DATA0, or DATA1)
         let (d0, d1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
         let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
-        let slot = lds(format!("{a} + {off16}u"));
+        let slot = format!("xcl_lds[{t}_i]");
         let body = rmw32(&op, &At::Ref(slot), &v, &v2, &format!("{t}_o"), &t).ok_or("DS")?;
-        self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {body} }}"));
+        self.line(&format!(
+            "uint {t}_o = 0u; if ({act}) {{ uint {t}_i = ((({a} + {off16}u) >> 2) & 16383u); if ({t}_i <= {top}) {{ {body} }} }}"
+        ));
         if rtn {
             let r = self.vreg(f("VDST"));
             self.line(&format!("if ({act}) {r} = {t}_o;"));
@@ -5152,7 +5150,12 @@ impl Em {
                     let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
                     for (slot, r) in regs.iter().enumerate() {
                         for c in 0..4 {
-                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[min(((src + {}u) >> 2) & 16383u, 8191u)]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                            let _ = writeln!(
+                                h,
+                                "        {{ uint xcl_gi = ((src + {}u) >> 2) & 16383u; res.Store((dst + {}u) * 4u, (xcl_gi <= 8191u) ? xcl_lds[min(xcl_gi, 8191u)] : 0u); }}",
+                                16 * r + 4 * c as u32,
+                                4 * slot + c
+                            );
                         }
                     }
                     h.push_str("    }\n");
@@ -5231,7 +5234,12 @@ impl Em {
                 let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
                 for (slot, r) in regs.iter().enumerate() {
                     for c in 0..4 {
-                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[min(((src + {}u) >> 2) & 16383u, 8191u)]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                        let _ = writeln!(
+                            h,
+                            "        {{ uint xcl_gi = ((src + {}u) >> 2) & 16383u; res.Store((dst + {}u) * 4u, (xcl_gi <= XCL_X_LDS_TOP) ? xcl_lds[min(xcl_gi, XCL_X_LDS_TOP)] : 0u); }}",
+                            16 * r + 4 * c as u32,
+                            4 * slot + c
+                        );
                     }
                 }
                 h.push_str("    }\n");
