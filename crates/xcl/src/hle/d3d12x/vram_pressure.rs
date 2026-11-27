@@ -47,7 +47,7 @@ impl OomBackoff {
 
     /// Returns `true` if `now` is within an active backoff window, incrementing `avoided`.
     pub(super) fn should_skip(&mut self, now: Instant) -> bool {
-        if self.until.is_some_and(|u| now < u) {
+        if self.is_active(now) {
             self.avoided += 1;
             true
         } else {

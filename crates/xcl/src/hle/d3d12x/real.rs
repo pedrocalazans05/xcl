@@ -4172,7 +4172,7 @@ pub fn switch_form_retries() -> u64 {
 unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static AMD_DRIVER_PSO_LOCK: Mutex<()> = Mutex::new(());
     let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    let injected = heap && INJECTED_OOM.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
     let hr = if injected {
         E_OUTOFMEMORY
     } else if serialize_driver_pso(this) {
