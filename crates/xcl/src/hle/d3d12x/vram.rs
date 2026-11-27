@@ -698,7 +698,7 @@ impl std::ops::Index<usize> for PoolHeaps {
     }
 }
 
-fn keep_spare_pools() -> usize {
+pub(super) fn keep_spare_pools() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("XCL_VRAM_KEEP_SPARE_POOLS")
@@ -2128,6 +2128,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 }
             }
         }
+    }
+    if do_reclaim {
+        super::vram_small::reclaim(dev_key, now);
     }
     let reclaimed_pools = newly_reclaimed.len();
     #[cfg(test)]
