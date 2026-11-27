@@ -25,12 +25,19 @@ pub enum Target {
 pub enum Decision {
     Pass,
     Use(String),
-    /// Use this path with a rewritten Win32 creation disposition (e.g. `TRUNCATE_EXISTING`
-    /// on an un-overlaid game file becomes `CREATE_ALWAYS` in the overlay so no placeholder
-    /// file is published before the native open succeeds).
-    UseWithDisposition(String, u32),
-    /// CREATE_ALWAYS creates an overlay file over an existing original.
-    CreateOverOriginal(String),
+    /// Redirect a write/create on a game path to the overlay. Whiteout removal and write
+    /// recording are deferred until `Vfs::commit_write(&rel)` is called after the native
+    /// open succeeds, so a failed `CreateFile` cannot resurrect a whited-out original.
+    /// When `disposition` is `Some(d)` (e.g. `TRUNCATE_EXISTING` on an un-overlaid game
+    /// file rewritten to `CREATE_ALWAYS`), use `d` for the native open. When `over_original`
+    /// is true (`CREATE_ALWAYS` over an existing un-overlaid game file), report
+    /// `ERROR_ALREADY_EXISTS` on success.
+    UseWrite {
+        path: String,
+        rel: String,
+        disposition: Option<u32>,
+        over_original: bool,
+    },
     /// Fail with this Win32 error code.
     Fail(u32),
 }
@@ -507,9 +514,10 @@ impl Vfs {
         self.record_write(rel);
     }
 
-    /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
-    /// and return the overlay path.
-    pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+    /// Stage `rel` in the overlay (copying the original when `keep_content`) without
+    /// removing whiteouts or recording the write yet. Call `commit_write(rel)` only after
+    /// the underlying open/write succeeds.
+    pub fn stage_open_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
         let ov = self.overlay_path(rel);
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
@@ -522,8 +530,14 @@ impl Vfs {
                 std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             }
         }
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        Ok(ov)
+    }
+
+    /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
+    /// and return the overlay path.
+    pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
+        let ov = self.stage_open_write(rel, keep_content)?;
+        self.commit_write(rel);
         Ok(ov)
     }
 
@@ -586,10 +600,13 @@ impl Vfs {
                     && !ov_entry
                     && in_orig
                     && Path::new(&self.original_path(&rel)).is_file();
-                match self.prepare_write(&rel, keep) {
-                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
-                    Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
-                    Ok(p) => Decision::Use(p),
+                match self.stage_open_write(&rel, keep) {
+                    Ok(path) => Decision::UseWrite {
+                        path,
+                        rel,
+                        disposition: (disposition == TRUNCATE_EXISTING && !ov_entry).then_some(CREATE_ALWAYS),
+                        over_original: replaces_original,
+                    },
                     Err(e) => Decision::Fail(e),
                 }
             }
@@ -827,18 +844,24 @@ mod tests {
         );
         // write → overlay copy with original content
         let d = v.open_decision("G:\\data\\hello.txt", 0x4000_0000, OPEN_EXISTING, 0);
-        let Decision::Use(ov) = d else { panic!("{d:?}") };
+        let Decision::UseWrite { path: ov, rel, disposition: None, over_original: false } = d else { panic!("{d:?}") };
         assert!(ov.contains("overlay"));
         assert_eq!(std::fs::read(&ov).unwrap(), b"original");
+        v.commit_write(&rel);
         std::fs::write(&ov, b"modified").unwrap();
         // later reads see the overlay
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Use(ov.clone()));
         // original untouched
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
         // CREATE_ALWAYS on a new file → overlay, nothing created in the game folder
-        let Decision::Use(newp) = v.open_decision("G:\\data\\new.bin", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
+        let Decision::UseWrite { path: newp, rel: new_rel, disposition: None, over_original: false } =
+            v.open_decision("G:\\data\\new.bin", 0x4000_0000, CREATE_ALWAYS, 0)
+        else {
+            panic!()
+        };
         assert!(newp.contains("overlay"));
         assert!(!f.game().join("data").join("new.bin").exists());
+        v.commit_write(&new_rel);
         // CREATE_NEW on an existing file fails
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0), Decision::Fail(ERROR_FILE_EXISTS));
         assert_eq!(v.redirected_writes(), vec!["data\\hello.txt".to_string(), "data\\new.bin".to_string()]);
@@ -856,9 +879,15 @@ mod tests {
         // persisted
         let v2 = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
         assert!(v2.is_whiteout("data\\gone.txt"));
-        // re-creating the file un-hides it (in the overlay)
-        let Decision::Use(p) = v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
+        // staging a write does NOT remove the whiteout until commit_write is called after CreateFile succeeds
+        let Decision::UseWrite { path: p, rel, disposition: None, over_original: false } =
+            v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0)
+        else {
+            panic!()
+        };
         assert!(p.contains("overlay"));
+        assert!(v.is_whiteout("data\\gone.txt"), "whiteout must remain until open succeeds");
+        v.commit_write(&rel);
         assert!(!v.is_whiteout("data\\gone.txt"));
     }
 
@@ -926,10 +955,10 @@ mod tests {
 
         // Un-overlaid game file: TRUNCATE_EXISTING rewrites disposition to CREATE_ALWAYS in the
         // overlay WITHOUT publishing a placeholder file before the native CreateFile call runs.
-        let Decision::UseWithDisposition(ov, disp) =
+        let Decision::UseWrite { path: ov, rel, disposition: Some(disp), over_original: false } =
             v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0)
         else {
-            panic!("expected Decision::UseWithDisposition for TRUNCATE_EXISTING on un-overlaid game file");
+            panic!("expected Decision::UseWrite with rewritten disposition for TRUNCATE_EXISTING on un-overlaid game file");
         };
         assert!(ov.contains("overlay"));
         assert_eq!(disp, CREATE_ALWAYS);
@@ -951,6 +980,7 @@ mod tests {
         };
         assert_ne!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
         unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+        v.commit_write(&rel);
         assert_eq!(std::fs::read(&ov).unwrap(), b"");
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
 
@@ -958,7 +988,12 @@ mod tests {
         std::fs::write(&ov, b"overlay-content").unwrap();
         assert_eq!(
             v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0),
-            Decision::Use(ov.clone())
+            Decision::UseWrite {
+                path: ov.clone(),
+                rel: "data\\hello.txt".into(),
+                disposition: None,
+                over_original: false,
+            }
         );
         assert_eq!(std::fs::read(&ov).unwrap(), b"overlay-content");
         let h2 = unsafe {
@@ -1117,11 +1152,13 @@ mod tests {
         assert!(v2.is_whiteout("data\\gone.txt"));
         assert!(v2.is_whiteout("data\\sub\\deep.txt"));
 
-        // Recreating one file un-hides only that file.
-        let Decision::Use(p) = v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
+        // Recreating one file un-hides only that file once committed.
+        let Decision::UseWrite { path: p, rel, .. } = v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
             panic!("expected overlay path");
         };
+        assert!(v.is_whiteout("data\\hello.txt"), "whiteout stays until open succeeds");
         std::fs::write(&p, b"fresh").unwrap();
+        v.commit_write(&rel);
         assert!(!v.is_whiteout("data\\hello.txt"));
         assert!(v.is_whiteout("data\\gone.txt"));
         assert!(v.is_whiteout("data\\sub\\deep.txt"));

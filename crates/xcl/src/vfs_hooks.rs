@@ -83,6 +83,7 @@ fn log_open(api: &str, path: &str, flags: u32) {
 }
 
 fn apply_open_decision(
+    v: &vfs::Vfs,
     decision: Decision,
     disposition: u32,
     passthrough: impl FnOnce() -> HANDLE,
@@ -91,12 +92,22 @@ fn apply_open_decision(
     match decision {
         Decision::Pass => passthrough(),
         Decision::Use(path) => redirected(wide(&path).as_ptr(), disposition),
-        Decision::UseWithDisposition(path, disposition) => redirected(wide(&path).as_ptr(), disposition),
-        Decision::CreateOverOriginal(path) => {
-            let handle = redirected(wide(&path).as_ptr(), disposition);
-            // Report that the virtual file existed before the open.
+        Decision::UseWrite {
+            path,
+            rel,
+            disposition: rewritten_disp,
+            over_original,
+        } => {
+            let disp = rewritten_disp.unwrap_or(disposition);
+            let handle = redirected(wide(&path).as_ptr(), disp);
             if handle != INVALID_HANDLE_VALUE {
-                unsafe { SetLastError(vfs::ERROR_ALREADY_EXISTS) };
+                let err = unsafe { GetLastError() };
+                v.commit_write(&rel);
+                // Report that the virtual file existed before the open, or preserve the
+                // native open's last error across commit_write's whiteout persistence I/O.
+                unsafe {
+                    SetLastError(if over_original { vfs::ERROR_ALREADY_EXISTS } else { err });
+                }
             }
             handle
         }
@@ -113,6 +124,7 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileW", &path, fl);
     apply_open_decision(
+        v,
         v.open_decision(&path, acc, disp, fl),
         disp,
         || orig(n, acc, sh, sa, disp, fl, t),
@@ -126,6 +138,7 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileA", &path, fl);
     apply_open_decision(
+        v,
         v.open_decision(&path, acc, disp, fl),
         disp,
         || orig(n, acc, sh, sa, disp, fl, t),
@@ -141,6 +154,7 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
     log_open("CreateFile2", &path, flags);
     apply_open_decision(
+        v,
         v.open_decision(&path, acc, disp, flags),
         disp,
         || orig(n, acc, sh, disp, params),
@@ -1337,6 +1351,7 @@ mod tests {
         let overwrite = |path| {
             let decision = f.vfs.open_decision(path, GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
             let handle = apply_open_decision(
+                &f.vfs,
                 decision,
                 CREATE_ALWAYS,
                 || panic!("game paths must go through the overlay"),
@@ -1367,6 +1382,7 @@ mod tests {
         assert_eq!(overwrite(r"G:\data\new.txt"), 0);
         let decision = f.vfs.open_decision(r"G:\data\gone.txt", GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
         let handle = apply_open_decision(
+            &f.vfs,
             decision,
             CREATE_ALWAYS,
             || panic!("expected overlay redirection"),
@@ -1381,6 +1397,73 @@ mod tests {
 
         f.vfs.delete_file(r"data\gone.txt").unwrap();
         assert_eq!(overwrite(r"G:\data\gone.txt"), 0, "creating a whited-out file");
+    }
+
+    #[test]
+    fn failed_create_file_on_whited_out_file_keeps_original_hidden() {
+        use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, OPEN_ALWAYS, OPEN_EXISTING};
+
+        let f = HookFixture::new("failed_create_whiteout");
+        let v = &f.vfs;
+        assert_eq!(v.delete_file(r"data\gone.txt"), Ok(()));
+        assert!(v.is_whiteout(r"data\gone.txt"));
+        assert_eq!(f.read_vfs(r"G:\data\gone.txt"), None);
+
+        // Failing CreateFile across CREATE_ALWAYS, CREATE_NEW, and OPEN_ALWAYS must never
+        // remove the whiteout or resurrect the hidden original file.
+        for disposition in [CREATE_ALWAYS, CREATE_NEW, OPEN_ALWAYS] {
+            let decision = v.open_decision(r"G:\data\gone.txt", GENERIC_WRITE, disposition, FILE_ATTRIBUTE_NORMAL);
+            let handle = apply_open_decision(
+                v,
+                decision,
+                disposition,
+                || panic!("expected overlay redirection"),
+                |_, _| {
+                    unsafe { SetLastError(vfs::ERROR_ACCESS_DENIED) };
+                    INVALID_HANDLE_VALUE
+                },
+            );
+            assert_eq!(handle, INVALID_HANDLE_VALUE);
+            assert_eq!(unsafe { GetLastError() }, vfs::ERROR_ACCESS_DENIED);
+            assert!(v.is_whiteout(r"data\gone.txt"), "whiteout dropped after failed open (disp={disposition})");
+            assert_eq!(f.read_vfs(r"G:\data\gone.txt"), None, "original file resurrected (disp={disposition})");
+            assert_eq!(
+                v.open_decision(r"G:\data\gone.txt", 0x8000_0000, OPEN_EXISTING, 0),
+                Decision::Fail(vfs::ERROR_FILE_NOT_FOUND)
+            );
+        }
+
+        // Reloading whiteouts from disk must also keep the original hidden.
+        let reloaded = vfs::Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
+        assert!(reloaded.is_whiteout(r"data\gone.txt"));
+
+        // A subsequent successful CreateFileW commits the write, clears the whiteout,
+        // and exposes the new overlay file rather than the original.
+        let decision = v.open_decision(r"G:\data\gone.txt", GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL);
+        let handle = apply_open_decision(
+            v,
+            decision,
+            CREATE_ALWAYS,
+            || panic!("expected overlay redirection"),
+            |p, disp| unsafe {
+                CreateFileW(
+                    p,
+                    GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    disp,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            },
+        );
+        let err = unsafe { GetLastError() };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        assert_eq!(err, 0);
+        assert_ne!(unsafe { CloseHandle(handle) }, 0);
+        assert!(!v.is_whiteout(r"data\gone.txt"));
+        assert_eq!(f.read_vfs(r"G:\data\gone.txt").as_deref(), Some(&b""[..]));
+        assert_eq!(std::fs::read(f.game().join("data/gone.txt")).unwrap(), b"bye");
     }
 
     fn real_move(s: *const u16, d: *const u16, f: u32) -> i32 {
