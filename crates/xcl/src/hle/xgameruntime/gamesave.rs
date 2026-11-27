@@ -151,8 +151,8 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
-fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Write `data` to a unique sibling temp file and flush it to disk without publishing yet.
+fn stage_temp_file(dest: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
     let parent = dest
         .parent()
@@ -163,10 +163,19 @@ fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
-        drop(f);
-        replace_file(&tmp, dest)?;
         Ok(())
     })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
+fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = stage_temp_file(dest, data)?;
+    let res = replace_file(&tmp, dest);
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -565,31 +574,133 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
+enum StagedOp {
+    Write { dest: PathBuf, tmp: PathBuf },
+    Delete { dest: PathBuf },
+}
+
+enum PrevState {
+    Missing,
+    File(Vec<u8>),
+}
+
+fn snapshot_prev(path: &Path) -> std::io::Result<PrevState> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(PrevState::File(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PrevState::Missing),
+        Err(e) => Err(e),
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+fn rollback_changes(rollback_log: Vec<(PathBuf, PrevState)>) {
+    for (path, prev) in rollback_log.into_iter().rev() {
+        match prev {
+            PrevState::File(bytes) => {
+                let _ = write_atomic(&path, &bytes);
+            }
+            PrevState::Missing => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+fn cleanup_staged(staged: &[StagedOp]) {
+    for op in staged {
+        if let StagedOp::Write { tmp, .. } = op {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
     }
+
+    // Phase 1: Stage all writes to unique sibling temp files and sync them to disk
+    // before touching any final file.
+    let mut staged: Vec<StagedOp> = Vec::with_capacity(ops.len() + usize::from(display.is_some()));
     if let Some(d) = display {
-        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
-            return crate::util::E_FAIL;
+        let dest = dir.join("display");
+        match stage_temp_file(&dest, d.as_bytes()) {
+            Ok(tmp) => staged.push(StagedOp::Write { dest, tmp }),
+            Err(_) => {
+                cleanup_staged(&staged);
+                return crate::util::E_FAIL;
+            }
         }
     }
     for (name, data) in ops {
-        let path = blobs.join(enc(name));
+        let dest = blobs.join(enc(name));
         match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
+            Some(d) => match stage_temp_file(&dest, d) {
+                Ok(tmp) => staged.push(StagedOp::Write { dest, tmp }),
+                Err(_) => {
+                    cleanup_staged(&staged);
+                    return crate::util::E_FAIL;
+                }
+            },
+            None => staged.push(StagedOp::Delete { dest }),
+        }
+    }
+
+    // Phase 2: Snapshot each target's pre-update state before its first mutation,
+    // then publish. On any failure, roll back every already-published change.
+    let mut seen = std::collections::HashSet::new();
+    let mut rollback_log: Vec<(PathBuf, PrevState)> = Vec::new();
+    for (idx, op) in staged.iter().enumerate() {
+        let dest = match op {
+            StagedOp::Write { dest, .. } | StagedOp::Delete { dest } => dest,
+        };
+        let key = path_key(dest);
+        let prev = if !seen.contains(&key) {
+            match snapshot_prev(dest) {
+                Ok(prev) => Some(prev),
+                Err(_) => {
+                    cleanup_staged(&staged[idx..]);
+                    rollback_changes(rollback_log);
                     return crate::util::E_FAIL;
                 }
             }
-            None => {
-                let _ = std::fs::remove_file(&path);
-            }
+        } else {
+            None
+        };
+
+        let step_res = match op {
+            StagedOp::Write { dest, tmp } => replace_file(tmp, dest),
+            StagedOp::Delete { dest } => match std::fs::remove_file(dest) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            },
+        };
+
+        if step_res.is_err() {
+            cleanup_staged(&staged[idx..]);
+            rollback_changes(rollback_log);
+            return crate::util::E_FAIL;
+        }
+
+        if let Some(prev) = prev {
+            seen.insert(key);
+            rollback_log.push((dest.clone(), prev));
         }
     }
+
     S_OK
 }
 
@@ -1182,6 +1293,104 @@ mod tests {
         let (reads, mixed) = reader.join().unwrap();
         assert!(reads > 0, "the reader never enumerated blobs");
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
+    }
+
+    #[test]
+    fn failed_second_blob_rolls_back_earlier_writes_deletes_and_display() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-gamesave-atomic-rollback-{}-{nonce}", std::process::id())));
+        let dir = root.0.join("slot");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Seed v1 state: display + two existing blobs.
+        assert_eq!(
+            apply(
+                &dir,
+                Some("Save v1"),
+                &[
+                    ("first".into(), Some(b"v1-first".to_vec())),
+                    ("second".into(), Some(b"v1-second".to_vec())),
+                ],
+            ),
+            S_OK
+        );
+
+        let blobs_dir = dir.join("b");
+        let second_path = blobs_dir.join(enc("second"));
+        // Hold a read-only handle without write/delete sharing so snapshot reads succeed
+        // but MoveFileExW onto `second` fails with ERROR_SHARING_VIOLATION.
+        let lock_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&second_path)
+            .unwrap();
+
+        // Update mutates display, overwrites `first`, creates `added`, and fails on `second`.
+        let hr = apply(
+            &dir,
+            Some("Save v2"),
+            &[
+                ("first".into(), Some(b"v2-first".to_vec())),
+                ("added".into(), Some(b"v2-added".to_vec())),
+                ("second".into(), Some(b"v2-second".to_vec())),
+            ],
+        );
+        assert_eq!(hr, E_FAIL);
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Save v1");
+        assert_eq!(std::fs::read(blobs_dir.join(enc("first"))).unwrap(), b"v1-first");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"v1-second");
+        assert!(!blobs_dir.join(enc("added")).exists(), "newly added blob must be rolled back");
+
+        // Deleting `first` before failing on `second` must also restore `first`.
+        let hr = apply(
+            &dir,
+            Some("Save v3"),
+            &[
+                ("first".into(), None),
+                ("second".into(), Some(b"v3-second".to_vec())),
+            ],
+        );
+        assert_eq!(hr, E_FAIL);
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Save v1");
+        assert_eq!(std::fs::read(blobs_dir.join(enc("first"))).unwrap(), b"v1-first");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"v1-second");
+
+        // No staged temp files should remain in either directory.
+        for check_dir in [&dir, &blobs_dir] {
+            let leftovers: Vec<_> = std::fs::read_dir(check_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+                .collect();
+            assert!(leftovers.is_empty(), "temp files leaked in {}: {leftovers:?}", check_dir.display());
+        }
+
+        drop(lock_handle);
+        // Once the lock is released, the full update commits cleanly.
+        assert_eq!(
+            apply(
+                &dir,
+                Some("Save v2"),
+                &[
+                    ("first".into(), Some(b"v2-first".to_vec())),
+                    ("second".into(), Some(b"v2-second".to_vec())),
+                ],
+            ),
+            S_OK
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Save v2");
+        assert_eq!(std::fs::read(blobs_dir.join(enc("first"))).unwrap(), b"v2-first");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"v2-second");
     }
 
 }
