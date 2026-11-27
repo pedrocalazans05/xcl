@@ -319,10 +319,7 @@ pub fn record_fallback(stage: &str, err: &str) -> String {
     key
 }
 
-/// The live summary: per stage direct / fallback counts and the fallback reasons ranked.
-pub fn fallback_summary() -> String {
-    let fb = FALLBACKS.lock().map(|m| m.clone()).unwrap_or_default();
-    let ok = TRANSLATED.lock().map(|m| m.clone()).unwrap_or_default();
+fn format_fallback_summary(fb: BTreeMap<(String, String), usize>, ok: BTreeMap<String, usize>) -> String {
     let mut per_stage: BTreeMap<String, (usize, usize)> = ok.iter().map(|(k, v)| (k.clone(), (*v, 0))).collect();
     for ((st, _), n) in &fb {
         per_stage.entry(st.clone()).or_default().1 += n;
@@ -339,12 +336,36 @@ pub fn fallback_summary() -> String {
     s
 }
 
+/// The live summary: per stage direct / fallback counts and the fallback reasons ranked.
+pub fn fallback_summary() -> String {
+    let fb = FALLBACKS.lock().map(|m| m.clone()).unwrap_or_default();
+    let ok = TRANSLATED.lock().map(|m| m.clone()).unwrap_or_default();
+    format_fallback_summary(fb, ok)
+}
+
+/// Non-blocking variant of [`fallback_summary`] for crash/final reporting.
+pub fn try_fallback_summary() -> Option<String> {
+    let fb = FALLBACKS.try_lock().ok()?.clone();
+    let ok = TRANSLATED.try_lock().ok()?.clone();
+    Some(format_fallback_summary(fb, ok))
+}
+
 /// Prints [`fallback_summary`] to stderr and the log when `XCL_DIRECT_DXIL_STATS` is set.
 pub fn dump_fallbacks() {
     if stats_enabled() {
         let s = fallback_summary();
         eprintln!("{s}");
         crate::xlog_info!("{}", s);
+    }
+}
+
+/// Non-blocking variant of [`dump_fallbacks`] for crash/final reporting.
+pub fn try_dump_fallbacks() {
+    if stats_enabled() {
+        if let Some(s) = try_fallback_summary() {
+            eprintln!("{s}");
+            crate::xlog_info!("{}", s);
+        }
     }
 }
 

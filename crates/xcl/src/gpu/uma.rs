@@ -715,6 +715,10 @@ impl Uma {
     pub fn used(&self) -> usize {
         self.inner.lock().unwrap().used.values().sum()
     }
+
+    pub fn try_used(&self) -> Option<usize> {
+        self.inner.try_lock().ok().map(|g| g.used.values().sum())
+    }
 }
 
 impl Drop for Uma {
@@ -865,6 +869,10 @@ impl Uma {
 
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048;
 /// `XCL_UMA_WINDOWS=4|8|16`, default 4, with 8/16 requiring `XCL_HEAP_WINDOWS=1`).
+pub fn try_get() -> Option<&'static Uma> {
+    GLOBAL.get().and_then(|o| o.as_ref())
+}
+
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
         .get_or_init(|| {

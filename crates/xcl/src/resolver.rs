@@ -54,6 +54,10 @@ pub fn records() -> Vec<ImportRecord> {
     RECORDS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
+pub fn try_records() -> Option<Vec<ImportRecord>> {
+    RECORDS.try_lock().ok().map(|v| v.clone())
+}
+
 fn fname(what: &ImportName) -> String {
     what.to_string()
 }

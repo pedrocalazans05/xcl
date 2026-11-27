@@ -80,6 +80,10 @@ pub fn mapped_modules() -> Vec<Arc<MappedModule>> {
     MAPPED.read().map(|v| v.clone()).unwrap_or_default()
 }
 
+pub fn try_mapped_modules() -> Option<Vec<Arc<MappedModule>>> {
+    MAPPED.try_read().ok().map(|v| v.clone())
+}
+
 pub fn find_mapped_by_name(name: &str) -> Option<Arc<MappedModule>> {
     let key = crate::util::dll_key(name);
     MAPPED.read().ok()?.iter().find(|m| m.name == key).cloned()

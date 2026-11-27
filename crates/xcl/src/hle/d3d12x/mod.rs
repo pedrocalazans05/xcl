@@ -76,9 +76,14 @@ pub enum Backend {
 }
 
 /// Decided once: the real backend unless disabled or the driver refuses.
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+pub fn try_backend() -> Option<Backend> {
+    BACKEND.get().copied()
+}
+
 pub fn backend() -> Backend {
-    static B: OnceLock<Backend> = OnceLock::new();
-    *B.get_or_init(|| {
+    *BACKEND.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
             crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
