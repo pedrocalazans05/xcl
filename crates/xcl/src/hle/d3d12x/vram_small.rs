@@ -53,6 +53,11 @@ struct Slot {
     offset: u32,
     users: u32,
     idle_since: Option<Instant>,
+    /// True once a resource has been successfully backed by this slot.
+    had_resource: bool,
+    /// Prior `idle_since` when an idle slot is re-acquired, preserved in case creation fails
+    /// and rolls back so the block cannot bypass `IDLE` + `COOL`.
+    prior_idle_since: Option<Instant>,
 }
 
 struct SmallPools<H> {
@@ -145,7 +150,9 @@ impl<H: Clone> SmallPools<H> {
         self.sweep_idle(now);
         if let Some(s) = self.slots.get_mut(&key) {
             s.users += 1;
-            s.idle_since = None;
+            if let Some(prev) = s.idle_since.take() {
+                s.prior_idle_since = Some(prev);
+            }
             return Some((self.pools[s.pool as usize].as_ref().expect("live small pool").heap.clone(), s.offset));
         }
         let units = key.1;
@@ -164,7 +171,7 @@ impl<H: Clone> SmallPools<H> {
             return None;
         };
         let heap = self.pools[pool as usize].as_ref().expect("live small pool").heap.clone();
-        self.slots.insert(key, Slot { pool, offset, users: 1, idle_since: None });
+        self.slots.insert(key, Slot { pool, offset, users: 1, idle_since: None, had_resource: false, prior_idle_since: None });
         self.used_units += units as usize;
         Some((heap, offset))
     }
@@ -194,16 +201,21 @@ impl<H: Clone> SmallPools<H> {
     }
 
     fn note_resource(&mut self, res: usize, key: SlotKey) {
+        if let Some(s) = self.slots.get_mut(&key) {
+            s.had_resource = true;
+            s.prior_idle_since = None;
+        }
         self.resources.insert(res, key);
     }
 
     /// Release one user of `key`. When `rollback` is true (creation failed before the GPU ever saw
-    /// the resource), the block returns directly to `free` if this was its only user.
+    /// the resource), a freshly allocated block returns directly to `free`; a slot that previously
+    /// backed a resource preserves its idle/cooling window so another key cannot reuse it early.
     fn release_key(&mut self, key: SlotKey, now: Instant, rollback: bool) {
         let Some(s) = self.slots.get_mut(&key) else { return };
         s.users = s.users.saturating_sub(1);
         if s.users == 0 {
-            if rollback {
+            if rollback && !s.had_resource && s.prior_idle_since.is_none() {
                 if let Some(s) = self.slots.remove(&key) {
                     self.used_units -= key.1 as usize;
                     if let Some(p) = self.pools.get_mut(s.pool as usize).and_then(Option::as_mut) {
@@ -211,7 +223,26 @@ impl<H: Clone> SmallPools<H> {
                         self.free[key.1 as usize].push((s.pool, s.offset));
                     }
                 }
+            } else if rollback {
+                if let Some(prev) = s.prior_idle_since.take() {
+                    if now.duration_since(prev) >= IDLE {
+                        if let Some(s) = self.slots.remove(&key) {
+                            self.used_units -= key.1 as usize;
+                            self.cooling.push_back(((s.pool, s.offset, key.1), now));
+                        }
+                    } else {
+                        s.idle_since = Some(prev);
+                        if !self.idle.iter().any(|&(k, t)| k == key && t == prev) {
+                            let pos = self.idle.partition_point(|&(_, t)| t <= prev);
+                            self.idle.insert(pos, (key, prev));
+                        }
+                    }
+                } else {
+                    s.idle_since = Some(now);
+                    self.idle.push_back((key, now));
+                }
             } else {
+                s.prior_idle_since = None;
                 s.idle_since = Some(now);
                 self.idle.push_back((key, now));
             }
@@ -533,6 +564,41 @@ mod tests {
         assert_eq!((h1, off1), (1, 0));
         assert_eq!(p.pools.len(), 1, "vacated pool slot should be reused");
         assert_eq!(p.bytes(), (4 * UNIT, POOL_UNITS as usize * UNIT));
+    }
+
+    #[test]
+    fn rollback_of_resumed_idle_slot_preserves_cooldown_against_other_key() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p: SmallPools<u32> = SmallPools::new();
+
+        // Key A allocates block (0, 0) and releases it at t=10ms, entering the IDLE window.
+        let key_a = (0x10_0000usize, 4u32);
+        let key_b = (0x20_0000usize, 4u32);
+        let (ha, offa) = p.add_pool_and_acquire(0, key_a, at(0));
+        assert_eq!((ha, offa), (0, 0));
+        p.note_resource(1, key_a);
+        assert!(p.forget(1, at(10)));
+
+        // At t=500ms (still within IDLE), Key A re-acquires the idle slot, then creation fails
+        // and rolls back. The block must NOT return to `free` prematurely.
+        let (ha2, offa2) = p.try_acquire(key_a, at(500)).unwrap();
+        assert_eq!((ha2, offa2), (0, 0));
+        p.release_key(key_a, at(500), true);
+
+        // Key B tries to allocate at t=500ms: must get a fresh offset (0, 4), NOT (0, 0).
+        let (hb1, offb1) = p.try_acquire(key_b, at(500)).unwrap();
+        assert_eq!((hb1, offb1), (0, 4), "other key must not reuse rolled-back idle slot before IDLE+COOL");
+
+        // At t=2100ms (IDLE elapsed since t=10ms), Key A's slot moves to cooling; still not reusable.
+        let key_c = (0x30_0000usize, 4u32);
+        let (hc, offc) = p.try_acquire(key_c, at(2100)).unwrap();
+        assert_eq!((hc, offc), (0, 8), "block must still be cooling at +2.1s");
+
+        // At t=4200ms (COOL elapsed after sweep at 2100ms), block (0, 0) is finally safe to reuse.
+        let key_d = (0x40_0000usize, 4u32);
+        let (hd, offd) = p.try_acquire(key_d, at(4200)).unwrap();
+        assert_eq!((hd, offd), (0, 0), "block becomes reusable after IDLE + COOL");
     }
 
     #[test]
