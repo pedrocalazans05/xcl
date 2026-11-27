@@ -1056,13 +1056,26 @@ struct FirstError {
     file: Vec<u16>,
 }
 
+#[derive(Default)]
+struct Worker {
+    sender: Option<mpsc::Sender<Vec<Entry>>>,
+    failed: Option<FailedWorker>,
+}
+
+struct FailedWorker {
+    hr: HRESULT,
+    since_status: HRESULT,
+    draining: bool,
+    submitted: Vec<Entry>,
+}
+
 struct QueueInner {
     desc: [u8; 0x18],
     source_memory: bool,
     capacity: usize,
     pending: Mutex<Pending>,
     cancels: Mutex<Vec<CancelRule>>,
-    worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
+    worker: Mutex<Worker>,
     worker_active: (Mutex<bool>, Condvar),
     closed: AtomicBool,
     error_event: usize,
@@ -1073,6 +1086,17 @@ struct QueueInner {
     pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
     #[cfg(test)]
     test_hook: OnceLock<parallel::TestHook>,
+    #[cfg(test)]
+    worker_start: OnceLock<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
+}
+
+struct ActiveGuard<'a>(&'a QueueInner);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.worker_active.0.lock().unwrap() = false;
+        self.0.worker_active.1.notify_all();
+    }
 }
 
 impl QueueInner {
@@ -1102,39 +1126,94 @@ impl QueueInner {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        let mut batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
         if batch.is_empty() {
             return;
         }
-        if w.is_none() {
-            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
-            let q = Arc::clone(self);
-            *self.worker_active.0.lock().unwrap() = true;
-            let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
-            if started.is_err() {
-                *self.worker_active.0.lock().unwrap() = false;
-                self.worker_active.1.notify_all();
-                // Release `worker` before dropping `batch` so fence `Release` cannot re-enter under lock.
-                drop(w);
-                drop(batch);
+        if let Some(f) = w.failed.as_mut() {
+            if f.draining {
+                // A concurrent or re-entrant Submit queues behind the active batch.
+                f.submitted.extend(batch);
                 return;
             }
-            *w = Some(tx);
+            f.draining = true;
+            let (hr, since_status) = (f.hr, f.since_status);
+            *self.worker_active.0.lock().unwrap() = true;
+            let q = Arc::clone(self);
+            drop(w);
+            q.fail_unstarted(batch, hr, since_status);
+            return;
         }
-        let sent = w.as_ref().unwrap().send(batch);
+        if w.sender.is_none() {
+            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+            *self.worker_active.0.lock().unwrap() = true;
+            if let Err(error) = self.start_worker(rx) {
+                let hr = error.raw_os_error().map_or(E_ABORT, |c| crate::util::hresult_from_win32(c as u32));
+                w.failed = Some(FailedWorker { hr, since_status: S_OK, draining: true, submitted: Vec::new() });
+                // Also retire entries accepted while the thread was being started.
+                batch.append(&mut self.pending.lock().unwrap().entries);
+                let q = Arc::clone(self);
+                drop(w);
+                crate::xlog_warn!("DirectStorage: could not start queue worker ({error}); failing queued work");
+                q.fail_unstarted(batch, hr, S_OK);
+                return;
+            }
+            w.sender = Some(tx);
+        }
+        let sent = w.sender.as_ref().unwrap().send(batch);
         // Release `worker` before dropping any unsent `batch` returned in `Err`.
         drop(w);
         drop(sent);
     }
 
-    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
-        struct ActiveGuard<'a>(&'a QueueInner);
-        impl Drop for ActiveGuard<'_> {
-            fn drop(&mut self) {
-                *self.0.worker_active.0.lock().unwrap() = false;
-                self.0.worker_active.1.notify_all();
+    fn start_worker(self: &Arc<Self>, rx: mpsc::Receiver<Vec<Entry>>) -> std::io::Result<std::thread::JoinHandle<()>> {
+        #[cfg(test)]
+        if let Some(start) = self.worker_start.get() { start()?; }
+        let q = Arc::clone(self);
+        std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx))
+    }
+
+    fn fail_unstarted(self: Arc<Self>, mut entries: Vec<Entry>, hr: HRESULT, mut since_status: HRESULT) {
+        // Own the queue through callbacks that may release its last COM reference.
+        let active = ActiveGuard(&self);
+        loop {
+            for entry in entries {
+                match entry {
+                    Entry::Request { seq, req, file, .. } => {
+                        if !self.is_cancelled(seq, req.tag) {
+                            self.update_error(hr, req, file.as_deref(), &mut since_status);
+                        }
+                    }
+                    Entry::Refused { seq, hr, req, file, .. } => {
+                        if !self.is_cancelled(seq, req.tag) {
+                            self.update_error(hr, req, file.as_deref(), &mut since_status);
+                        }
+                    }
+                    Entry::Status(s, i) => {
+                        if let Some(slot) = s.slots.get(i as usize) {
+                            slot.store(since_status, Ordering::Release);
+                        }
+                        since_status = S_OK;
+                    }
+                    Entry::Signal(fence, value) => unsafe { fence.signal(value) },
+                    #[cfg(test)]
+                    Entry::Gate(_) => {},
+                }
+            }
+            let mut w = self.worker.lock().unwrap();
+            let f = w.failed.as_mut().unwrap();
+            entries = std::mem::take(&mut f.submitted);
+            if entries.is_empty() {
+                f.since_status = since_status;
+                f.draining = false;
+                // Clear active before another Submit can claim the failed queue.
+                drop(active);
+                return;
             }
         }
+    }
+
+    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
         let _active = ActiveGuard(self);
         if let Some(pool) = parallel::pool_for(self) {
             parallel::run(self, pool, rx);
@@ -1310,7 +1389,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         capacity,
         pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
         cancels: Mutex::new(Vec::new()),
-        worker: Mutex::new(None),
+        worker: Mutex::new(Worker::default()),
         worker_active: (Mutex::new(false), Condvar::new()),
         closed: AtomicBool::new(false),
         error_event: ev as usize,
@@ -1320,6 +1399,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         pool_override: OnceLock::new(),
         #[cfg(test)]
         test_hook: OnceLock::new(),
+        #[cfg(test)]
+        worker_start: OnceLock::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1349,7 +1430,7 @@ unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
         let obj = Box::from_raw(obj);
         // Drop the channel sender so the worker thread exits and drops its
         // Arc<QueueInner> (breaking the worker <-> queue cycle).
-        obj.inner.worker.lock().unwrap().take();
+        obj.inner.worker.lock().unwrap().sender.take();
         drop(obj);
     }
     n
@@ -1475,7 +1556,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         if q.closed.swap(true, Ordering::AcqRel) {
             Vec::new()
         } else {
-            w.take();
+            w.sender.take();
             std::mem::take(&mut pend.entries)
         }
     };
@@ -1715,6 +1796,262 @@ mod tests {
             v[FENCE_SIGNAL] = sig as usize;
             Box::leak(v.into_boxed_slice())
         })
+    }
+
+    fn start_failure_queue() -> (*mut c_void, *mut c_void) {
+        unsafe {
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            let mut s = std::ptr::null_mut();
+            assert_eq!(factory_create_queue(std::ptr::null_mut(), desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            assert_eq!(factory_create_status_array(std::ptr::null_mut(), 6, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            (q, s)
+        }
+    }
+
+    #[test]
+    fn a_failed_worker_start_completes_requests_statuses_and_fences() {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        unsafe {
+            for os_error in [Some(8), None] {
+                let (q, s) = start_failure_queue();
+                let starts = Arc::new(AtomicU32::new(0));
+                let start_count = Arc::clone(&starts);
+                assert!(queue(q).worker_start.set(Arc::new(move || Err(match os_error {
+                    Some(code) => { start_count.fetch_add(1, Ordering::Relaxed); std::io::Error::from_raw_os_error(code) },
+                    None => { start_count.fetch_add(1, Ordering::Relaxed); std::io::Error::other("forced worker start failure") },
+                }))).is_ok());
+                let expected = os_error.map_or(E_ABORT, |code| crate::util::hresult_from_win32(code as u32));
+                let event = queue_get_error_event(q);
+                assert!(!event.is_null());
+                let source = b"abcdefgh";
+                let mut destination = [0xCCu8; 8];
+                let destination_address = destination.as_mut_ptr() as u64;
+                let req = |tag| request_ex(SOURCE_MEMORY_BIT, destination_address, 0, 8, source.as_ptr() as u64, 0, 8, 0, tag);
+                let fence = MockFence { vtbl: mock_fence_vtbl().as_ptr(), refs: AtomicU32::new(1), signalled: AtomicU64::new(0) };
+                let f = &fence as *const MockFence as *mut c_void;
+                queue_enqueue_request(q, req(0xA1).as_ptr());
+                queue_enqueue_status(q, s, 0);
+                queue_enqueue_signal(q, f, 42);
+                // Validation failures keep their own HRESULT; an empty interval succeeds.
+                queue_enqueue_request(q, request(0, 1, 8, 1, 0, 8).as_ptr());
+                queue_enqueue_status(q, s, 1);
+                queue_enqueue_status(q, s, 2);
+                queue_enqueue_request(q, req(3).as_ptr());
+                queue_cancel(q, u64::MAX, 3);
+                queue_enqueue_status(q, s, 3);
+                queue_enqueue_request(q, req(0xD4).as_ptr());
+                queue_enqueue_status(q, s, 4);
+                queue_enqueue_signal(q, f, 84);
+                assert_eq!(status_get_hresult(s, 0), E_PENDING);
+                assert_eq!(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+                queue_submit(q);
+                assert_eq!(destination, [0xCC; 8]);
+                for (i, hr) in [expected, E_SOURCE_TYPE, S_OK, S_OK, expected].into_iter().enumerate() {
+                    assert!(status_is_complete(s, i as u32));
+                    assert_eq!(status_get_hresult(s, i as u32), hr);
+                }
+                assert_eq!(fence.signalled.load(Ordering::Acquire), 84);
+                assert_eq!(fence.refs.load(Ordering::Acquire), 1);
+                assert_eq!(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+                let mut record = [0u8; ERROR_RECORD_BYTES];
+                queue_retrieve_error_record(q, record.as_mut_ptr());
+                assert_eq!(u32::from_le_bytes(record[0..4].try_into().unwrap()), 3);
+                assert_eq!(i32::from_le_bytes(record[8..12].try_into().unwrap()), expected);
+                assert_eq!(u64::from_le_bytes(record[0x248..0x250].try_into().unwrap()), 0xA1);
+                assert_eq!(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+                // A later request and status can be submitted in different batches.
+                queue_enqueue_request(q, req(5).as_ptr());
+                assert_eq!(WaitForSingleObject(event, 0), WAIT_TIMEOUT);
+                queue_submit(q);
+                // Reading the error record must not clear the unreported status interval.
+                queue_retrieve_error_record(q, record.as_mut_ptr());
+                assert_eq!(u32::from_le_bytes(record[0..4].try_into().unwrap()), 1);
+                assert_eq!(i32::from_le_bytes(record[8..12].try_into().unwrap()), expected);
+                assert_eq!(u64::from_le_bytes(record[0x248..0x250].try_into().unwrap()), 5);
+                queue_enqueue_status(q, s, 5);
+                queue_enqueue_status(q, s, 2);
+                queue_enqueue_signal(q, f, 99);
+                assert_eq!(status_get_hresult(s, 5), E_PENDING);
+                assert_eq!(fence.signalled.load(Ordering::Acquire), 84);
+                queue_submit(q);
+                assert_eq!(destination, [0xCC; 8]);
+                assert_eq!(status_get_hresult(s, 5), expected);
+                assert_eq!(status_get_hresult(s, 2), S_OK);
+                assert_eq!(status_get_hresult(s, 0), expected);
+                assert_eq!(fence.signalled.load(Ordering::Acquire), 99);
+                assert_eq!(fence.refs.load(Ordering::Acquire), 1);
+                assert!(!queue(q).closed.load(Ordering::Acquire));
+                assert_eq!(starts.load(Ordering::Relaxed), 1);
+                queue_close(q);
+                assert!(queue(q).closed.load(Ordering::Acquire));
+                assert!(queue(q).pending.lock().unwrap().entries.is_empty());
+                assert!(queue(q).worker.lock().unwrap().sender.is_none());
+                assert!(!*queue(q).worker_active.0.lock().unwrap());
+                CloseHandle(event);
+                queue_release(q);
+                status_release(s);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_worker_reentrant_submit_preserves_fifo_and_queue_lifetime() {
+        #[repr(C)]
+        struct ReentrantFence {
+            base: MockFence,
+            queue: usize,
+            status: usize,
+            values: Mutex<Vec<u64>>,
+        }
+        unsafe extern "system" fn signal(p: usize, value: u64) -> HRESULT {
+            let f = &*(p as *const ReentrantFence);
+            f.values.lock().unwrap().push(value);
+            if value == 42 {
+                let q = f.queue as *mut c_void;
+                queue_enqueue_request(q, request(0, 1, 8, 1, 0, 8).as_ptr());
+                queue_enqueue_status(q, f.status as *mut c_void, 2);
+                queue_enqueue_signal(q, p as *mut c_void, 126);
+                queue_submit(q);
+                // Entries enqueued without Submit must not join the active drain.
+                queue_enqueue_status(q, f.status as *mut c_void, 3);
+                queue_enqueue_signal(q, p as *mut c_void, 168);
+                queue_release(q); // the drainer must own the queue through the remaining callbacks
+            }
+            S_OK
+        }
+        unsafe {
+            let (q, s) = start_failure_queue();
+            let weak = Arc::downgrade(queue(q));
+            assert!(queue(q).worker_start.set(Arc::new(|| Err(std::io::Error::other("forced worker start failure")))).is_ok());
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let mut vtbl = mock_fence_vtbl().to_vec();
+            vtbl[FENCE_SIGNAL] = signal as usize;
+            let vtbl = Box::into_raw(vtbl.into_boxed_slice());
+            let fence = Box::into_raw(Box::new(ReentrantFence {
+                base: MockFence { vtbl: (&*vtbl).as_ptr(), refs: AtomicU32::new(1), signalled: AtomicU64::new(0) },
+                queue: q as usize, status: s as usize, values: Mutex::new(Vec::new()),
+            }));
+            queue_enqueue_request(q, request(0, 1, 8, 1, 0, 8).as_ptr());
+            queue_enqueue_status(q, s, 1);
+            queue_enqueue_signal(q, fence.cast(), 42);
+            queue_enqueue_signal(q, fence.cast(), 84);
+            let address = q as usize;
+            let (done, wait) = mpsc::channel();
+            let submitter = std::thread::spawn(move || { queue_submit(address as *mut c_void); let _ = done.send(()); });
+            // On timeout leave raw fixtures alive, as in the concurrent Close test.
+            wait.recv_timeout(std::time::Duration::from_secs(5)).expect("re-entrant Submit completed");
+            submitter.join().unwrap();
+            assert_eq!(*(*fence).values.lock().unwrap(), [42, 84, 126]);
+            assert_eq!((status_get_hresult(s, 1), status_get_hresult(s, 2)), (E_SOURCE_TYPE, E_SOURCE_TYPE));
+            assert_eq!(status_get_hresult(s, 3), E_PENDING);
+            assert_eq!((*fence).base.refs.load(Ordering::Acquire), 1);
+            assert!(weak.upgrade().is_none());
+            status_release(s);
+            drop(Box::from_raw(fence));
+            drop(Box::from_raw(vtbl));
+        }
+    }
+
+    #[test]
+    fn a_failed_worker_start_drains_pending_and_close_waits_for_notifications() {
+        use std::time::Duration;
+        const WAIT: Duration = Duration::from_secs(5);
+        #[repr(C)]
+        struct BlockingFence {
+            base: MockFence,
+            queue: usize,
+            values: Mutex<Vec<u64>>,
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+            locks_free: AtomicBool,
+            resumed: AtomicBool,
+        }
+        unsafe extern "system" fn signal(p: usize, value: u64) -> HRESULT {
+            let f = &*(p as *const BlockingFence);
+            let q = queue(f.queue as *mut c_void);
+            f.locks_free.fetch_and(q.worker.try_lock().is_ok() && q.pending.try_lock().is_ok(), Ordering::Relaxed);
+            q.submit(); // re-enter without queue locks; the active drainer keeps its FIFO
+            f.values.lock().unwrap().push(value);
+            if value == 42 {
+                let _ = f.entered.send(());
+                f.resumed.store(f.resume.lock().unwrap().recv_timeout(WAIT).is_ok(), Ordering::Release);
+            }
+            f.base.signalled.store(value, Ordering::Release);
+            S_OK
+        }
+        unsafe {
+            let (q, s) = start_failure_queue();
+            let (start_entered, start_seen) = mpsc::channel();
+            let (start_resume, start_wait) = mpsc::channel();
+            let start_wait = Mutex::new(start_wait);
+            assert!(queue(q).worker_start.set(Arc::new(move || {
+                let _ = start_entered.send(());
+                let _ = start_wait.lock().unwrap().recv_timeout(WAIT);
+                Err(std::io::Error::other("forced worker start failure"))
+            })).is_ok());
+            let (entered, seen) = mpsc::channel();
+            let (resume, wait) = mpsc::channel();
+            let mut vtbl = mock_fence_vtbl().to_vec();
+            vtbl[FENCE_SIGNAL] = signal as usize;
+            // A deadline failure leaves the raw fixture alive rather than freeing memory
+            // that a blocked callback could still use (as in the parallel queue tests).
+            let vtbl = Box::into_raw(vtbl.into_boxed_slice());
+            let fence = Box::into_raw(Box::new(BlockingFence {
+                base: MockFence { vtbl: (&*vtbl).as_ptr(), refs: AtomicU32::new(1), signalled: AtomicU64::new(0) },
+                queue: q as usize, values: Mutex::new(Vec::new()), entered, resume: Mutex::new(wait),
+                locks_free: AtomicBool::new(true), resumed: AtomicBool::new(false),
+            }));
+            let destination = Box::into_raw(Box::new([0xCCu8; 8]));
+            let source = b"abcdefgh";
+            let req = request(SOURCE_MEMORY_BIT, destination as u64, 8, source.as_ptr() as u64, 0, 8);
+            queue_enqueue_request(q, req.as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_enqueue_signal(q, fence.cast(), 42);
+            let address = q as usize;
+            let (submitted, submit_done) = mpsc::channel();
+            let submitter = std::thread::spawn(move || { queue_submit(address as *mut c_void); let _ = submitted.send(()); });
+            start_seen.recv_timeout(WAIT).expect("worker start hook");
+            // These entries arrive after the first batch was removed from pending.
+            queue_enqueue_request(q, req.as_ptr());
+            queue_enqueue_status(q, s, 1);
+            queue_enqueue_signal(q, fence.cast(), 84);
+            start_resume.send(()).unwrap();
+            seen.recv_timeout(WAIT).expect("failure drain reached first fence");
+            assert!(!queue(q).closed.load(Ordering::Acquire));
+            assert!(*queue(q).worker_active.0.lock().unwrap());
+            let (closing, close_started) = mpsc::channel();
+            let (closed, close_done) = mpsc::channel();
+            let closer = std::thread::spawn(move || {
+                let _ = closing.send(());
+                queue_close(address as *mut c_void);
+                let _ = closed.send(());
+            });
+            close_started.recv_timeout(WAIT).unwrap();
+            assert!(close_done.recv_timeout(Duration::from_millis(50)).is_err(), "Close passed an active notification");
+            resume.send(()).unwrap();
+            submit_done.recv_timeout(WAIT).expect("Submit completed");
+            close_done.recv_timeout(WAIT).expect("Close completed");
+            submitter.join().unwrap();
+            closer.join().unwrap();
+            assert_eq!(*destination, [0xCC; 8]);
+            assert_eq!((status_get_hresult(s, 0), status_get_hresult(s, 1)), (E_ABORT, E_ABORT));
+            assert_eq!(*(*fence).values.lock().unwrap(), [42, 84]);
+            assert!((*fence).locks_free.load(Ordering::Acquire));
+            assert!((*fence).resumed.load(Ordering::Acquire));
+            assert_eq!((*fence).base.refs.load(Ordering::Acquire), 1);
+            assert!(!*queue(q).worker_active.0.lock().unwrap());
+            queue_release(q);
+            status_release(s);
+            drop(Box::from_raw(fence));
+            drop(Box::from_raw(vtbl));
+            drop(Box::from_raw(destination));
+        }
     }
 
     #[test]
@@ -2176,7 +2513,7 @@ mod tests {
             queue_submit(q);
             assert_eq!(status_get_hresult(s, 1), S_OK);
             assert!(queue(q).pending.lock().unwrap().entries.is_empty());
-            assert!(queue(q).worker.lock().unwrap().is_none());
+            assert!(queue(q).worker.lock().unwrap().sender.is_none());
 
             queue_release(q);
             status_release(s);
