@@ -2140,6 +2140,22 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 // memory copy / fill / immediate write / timestamp
 // ---------------------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameWindowCopyPlan {
+    /// Copy in chunks of `capacity` bytes via the list's scratch buffer `scratch`.
+    ViaScratch { scratch: usize, capacity: u64 },
+    /// Scratch buffer is unavailable; skip the GPU copy rather than issuing an illegal
+    /// same-resource `CopyBufferRegion` in `COPY_DEST` state.
+    SkipUnavailableScratch,
+}
+
+fn plan_same_window_copy(scratch: Option<(usize, u64)>) -> SameWindowCopyPlan {
+    match scratch {
+        Some((scratch, capacity)) if capacity > 0 => SameWindowCopyPlan::ViaScratch { scratch, capacity },
+        _ => SameWindowCopyPlan::SkipUnavailableScratch,
+    }
+}
+
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2155,15 +2171,17 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
-    note_write(this as usize, dst, size);
     if d == s {
         // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the
         // bytes go through a scratch buffer of the list
-        let Some((t, capacity)) = copy_scratch(this, size) else {
-            // none to be had: within the buffer, as D3D12 does not define it (the ranges do not overlap)
-            as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
-            return;
+        let SameWindowCopyPlan::ViaScratch { scratch: t, capacity } = plan_same_window_copy(copy_scratch(this, size)) else {
+            return warn(
+                &N,
+                W,
+                format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) skipped: same-window scratch buffer unavailable"),
+            );
         };
+        note_write(this as usize, dst, size);
         // Later copies in this recording may need more than its first allocation. The ranges
         // are disjoint, so each chunk can reuse the same scratch after writing its destination.
         for offset in (0..size).step_by(capacity as usize) {
@@ -2182,6 +2200,7 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         }
         return;
     }
+    note_write(this as usize, dst, size);
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -4667,6 +4686,16 @@ mod tests {
             let s = internal_waits_summary();
             assert!(!s.contains("test wait 7d1c"), "{s}");
         }
+    }
+
+    #[test]
+    fn same_window_copy_plan_skips_when_scratch_unavailable() {
+        assert_eq!(plan_same_window_copy(None), SameWindowCopyPlan::SkipUnavailableScratch);
+        assert_eq!(plan_same_window_copy(Some((0x1000, 0))), SameWindowCopyPlan::SkipUnavailableScratch);
+        assert_eq!(
+            plan_same_window_copy(Some((0x1000, 0x1_0000))),
+            SameWindowCopyPlan::ViaScratch { scratch: 0x1000, capacity: 0x1_0000 }
+        );
     }
 
     #[test]
