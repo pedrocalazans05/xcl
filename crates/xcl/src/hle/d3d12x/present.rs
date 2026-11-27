@@ -15,7 +15,7 @@
 //! COMMON/PRESENT state, which consoles require before PresentX).
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
@@ -209,12 +209,14 @@ pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
     if !enabled() {
         return;
     }
-    let mut g = RTVS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
-    if !res.is_null() {
-        add_ref(res as usize);
-    }
-    let old = if res.is_null() { m.remove(&handle) } else { m.insert(handle, res as usize) };
+    let old = {
+        let mut g = RTVS.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if !res.is_null() {
+            add_ref(res as usize);
+        }
+        if res.is_null() { m.remove(&handle) } else { m.insert(handle, res as usize) }
+    };
     if let Some(o) = old {
         release(o);
     }
@@ -228,15 +230,39 @@ pub const USE_UAV: usize = 1;
 pub const USE_COPY: usize = 2;
 pub const USE_CLEAR: usize = 3;
 
+/// Parse a boolean-style diagnostic env var (`XCL_TRACE_FRAME`, `XCL_FRAME_DUMP_FULL`):
+/// unset, empty, `"0"`, `"false"`, `"off"`, and `"no"` (case-insensitive, trimmed) are false;
+/// any other value (e.g. `"1"`, `"true"`, `"on"`, `"yes"`) is true.
+fn parse_env_flag(val: Option<&str>) -> bool {
+    let Some(raw) = val else { return false };
+    let s = raw.trim();
+    !(s.is_empty()
+        || s == "0"
+        || s.eq_ignore_ascii_case("false")
+        || s.eq_ignore_ascii_case("off")
+        || s.eq_ignore_ascii_case("no"))
+}
+
 pub fn trace_frame() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FRAME").is_some())
+    *ON.get_or_init(|| parse_env_flag(std::env::var("XCL_TRACE_FRAME").ok().as_deref()))
 }
 
 /// `res` was used as `what` (USE_*)
 pub fn note_use(res: usize, what: usize) {
-    if trace_frame() && res != 0 {
+    if trace_frame() && res != 0 && what < 4 {
         USES.lock().unwrap().get_or_insert_with(HashMap::new).entry(res).or_default()[what] += 1;
+    }
+}
+
+/// Remove a released resource from `USES` so freed pointers do not accumulate or get
+/// attributed to a later resource allocated at the same address.
+pub(super) fn forget_resource(res: usize) {
+    if !trace_frame() || res == 0 {
+        return;
+    }
+    if let Some(m) = USES.lock().unwrap().as_mut() {
+        m.remove(&res);
     }
 }
 
@@ -1272,13 +1298,19 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
     if due && trace_frame() {
         let busiest = busiest_rt();
-        let followed = FOLLOWED.lock().unwrap();
+        let followed: Vec<ID3D12Resource> = {
+            let g = FOLLOWED.lock().unwrap();
+            g.iter()
+                .filter_map(|&r| {
+                    let rr = r as *mut c_void;
+                    Some(ID3D12Resource::from_raw_borrowed(&rr)?.clone())
+                })
+                .collect()
+        };
         let targets = busiest
             .into_iter()
-            .chain(followed.iter().copied())
-            .filter_map(|r| {
-                let rr = r as *mut c_void;
-                let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+            .chain(followed)
+            .filter_map(|res| {
                 let d = res.GetDesc();
                 if d.SampleDesc.Count > 1 {
                     return None;
@@ -1339,13 +1371,52 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
 }
 
+const DEFAULT_FRAME_DUMP_INTERVAL: u64 = 120;
+
+/// Parse `XCL_FRAME_DUMP`:
+/// - unset / empty / `"0"` / `"false"` / `"off"` / `"no"` (case-insensitive, trimmed) -> `Ok(0)` (disabled)
+/// - `"1"` / `"true"` / `"on"` / `"yes"` (case-insensitive, trimmed) -> `Ok(120)` (default interval)
+/// - integer `n > 1` -> `Ok(n)`
+/// - anything else -> `Err(())` (caller logs a warning and keeps dumping disabled)
+fn parse_frame_dump_interval(val: Option<&str>) -> Result<u64, ()> {
+    let Some(raw) = val else { return Ok(0) };
+    let s = raw.trim();
+    if s.is_empty()
+        || s == "0"
+        || s.eq_ignore_ascii_case("false")
+        || s.eq_ignore_ascii_case("off")
+        || s.eq_ignore_ascii_case("no")
+    {
+        return Ok(0);
+    }
+    if s == "1"
+        || s.eq_ignore_ascii_case("true")
+        || s.eq_ignore_ascii_case("on")
+        || s.eq_ignore_ascii_case("yes")
+    {
+        return Ok(DEFAULT_FRAME_DUMP_INTERVAL);
+    }
+    match s.parse::<u64>() {
+        Ok(n) if n > 1 => Ok(n),
+        _ => Err(()),
+    }
+}
+
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+        Ok(raw) => match parse_frame_dump_interval(Some(&raw)) {
+            Ok(n) => n,
+            Err(()) => {
+                crate::xlog_warn!(
+                    "present: ignoring invalid XCL_FRAME_DUMP={raw:?} (expected 0/off/false/no, 1/on/true/yes, or an integer > 1)"
+                );
+                0
+            }
+        },
         Err(_) => 0,
     });
     every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
@@ -1460,24 +1531,67 @@ pub unsafe fn watch_rt(rt: usize) {
         let d = x.GetDesc();
         if d.SampleDesc.Count > 1 { 0 } else { d.Width * d.Height as u64 }
     });
-    let mut g = WATCHED_RT.lock().unwrap();
-    if *g == Some(rt) || area(rt) <= g.map_or(0, area) {
-        return;
-    }
-    add_ref(rt);
-    if let Some(old) = g.replace(rt) {
+    let old = {
+        let mut g = WATCHED_RT.lock().unwrap();
+        if *g == Some(rt) || area(rt) <= g.map_or(0, area) {
+            return;
+        }
+        add_ref(rt);
+        g.replace(rt)
+    };
+    if let Some(old) = old {
         release(old);
     }
 }
 
-/// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
-/// multisampled one cannot be copied to a buffer – the present list would not close)
-fn busiest_rt() -> Option<usize> {
-    if let Some(r) = *WATCHED_RT.lock().unwrap() {
-        return Some(r);
+/// Rank resources by descending `USE_RT` count (excluding resources never bound as RT).
+fn rank_rt_candidates(uses: &HashMap<usize, [u64; 4]>) -> Vec<usize> {
+    let mut candidates: Vec<(usize, u64)> = uses
+        .iter()
+        .filter_map(|(&r, u)| (u[USE_RT] > 0).then_some((r, u[USE_RT])))
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.into_iter().map(|(r, _)| r).collect()
+}
+
+/// Pick the first ranked candidate that is currently referenced by `live_rtvs` (guaranteeing
+/// liveness while the `RTVS` lock is held) and accepted by `clone_single_sampled`.
+fn pick_live_rt<T>(
+    candidates: &[usize],
+    live_rtvs: &HashMap<usize, usize>,
+    mut clone_single_sampled: impl FnMut(usize) -> Option<T>,
+) -> Option<T> {
+    let live: HashSet<usize> = live_rtvs.values().copied().collect();
+    candidates.iter().copied().filter(|r| live.contains(r)).find_map(|r| clone_single_sampled(r))
+}
+
+/// The single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
+/// multisampled one cannot be copied to a buffer – the present list would not close).
+/// Returns an owned COM reference cloned while the owning tracking lock (`WATCHED_RT` or
+/// `RTVS`) is held so a concurrently released resource can never be dereferenced.
+fn busiest_rt() -> Option<ID3D12Resource> {
+    {
+        let g = WATCHED_RT.lock().unwrap();
+        if let Some(r) = *g {
+            let raw = r as *mut c_void;
+            if let Some(res) = unsafe { ID3D12Resource::from_raw_borrowed(&raw) } {
+                return Some(res.clone());
+            }
+        }
     }
-    let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
-    USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+    let candidates = {
+        let g = USES.lock().unwrap();
+        rank_rt_candidates(g.as_ref()?)
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+    let g = RTVS.lock().unwrap();
+    pick_live_rt(&candidates, g.as_ref()?, |r| unsafe {
+        let raw = r as *mut c_void;
+        let res = ID3D12Resource::from_raw_borrowed(&raw)?;
+        (res.GetDesc().SampleDesc.Count <= 1).then(|| res.clone())
+    })
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
@@ -1498,7 +1612,7 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
     // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail)
-    let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() { 1 } else { 4 };
+    let step = if parse_env_flag(std::env::var("XCL_FRAME_DUMP_FULL").ok().as_deref()) { 1 } else { 4 };
     let (ow, oh) = ((w / step).max(1), (h / step).max(1));
     let row = (ow * 3).div_ceil(4) * 4;
     let mut bmp = Vec::with_capacity(54 + row * oh);
@@ -1697,6 +1811,67 @@ mod tests {
         assert_eq!(source_uv_rect(got[0].1, 1600, 900), [0.1, 0.1, 0.5, 0.5]);
         assert_eq!(source_uv_rect(got[1].1, 3840, 2160), [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(source_uv_rect(Some([0, 0, 4000, 900]), 1920, 1080), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn parse_env_flag_handles_falsy_and_truthy_values() {
+        for v in [None, Some(""), Some("   "), Some("0"), Some(" 0 "), Some("false"), Some("FALSE"), Some(" False "), Some("off"), Some("OFF"), Some("no"), Some("NO")] {
+            assert!(!parse_env_flag(v), "expected false for {v:?}");
+        }
+        for v in [Some("1"), Some(" 1 "), Some("true"), Some("TRUE"), Some("on"), Some("yes"), Some("2")] {
+            assert!(parse_env_flag(v), "expected true for {v:?}");
+        }
+    }
+
+    #[test]
+    fn parse_frame_dump_interval_handles_off_default_custom_and_invalid() {
+        for v in [None, Some(""), Some("   "), Some("0"), Some(" 0 "), Some("false"), Some("FALSE"), Some("off"), Some("OFF"), Some("no"), Some("NO")] {
+            assert_eq!(parse_frame_dump_interval(v), Ok(0), "expected disabled for {v:?}");
+        }
+        for v in [Some("1"), Some(" 1 "), Some("true"), Some("TRUE"), Some("on"), Some("ON"), Some("yes"), Some("YES")] {
+            assert_eq!(parse_frame_dump_interval(v), Ok(DEFAULT_FRAME_DUMP_INTERVAL), "expected default interval for {v:?}");
+        }
+        assert_eq!(parse_frame_dump_interval(Some("2")), Ok(2));
+        assert_eq!(parse_frame_dump_interval(Some("60")), Ok(60));
+        assert_eq!(parse_frame_dump_interval(Some(" 300 ")), Ok(300));
+
+        for bad in ["abc", "-1", "00", "1.5", "18446744073709551616"] {
+            assert_eq!(parse_frame_dump_interval(Some(bad)), Err(()), "expected invalid for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn busiest_rt_selection_skips_dead_and_multisampled_candidates() {
+        let mut uses: HashMap<usize, [u64; 4]> = HashMap::new();
+        uses.insert(0xDEAD, [100, 0, 0, 0]); // busiest, but no longer in RTVS (released)
+        uses.insert(0x2000, [50, 0, 0, 0]); // live, but multisampled
+        uses.insert(0x3000, [20, 0, 0, 0]); // live, single-sampled (tie)
+        uses.insert(0x1000, [20, 0, 0, 0]); // live, single-sampled (tie, lower addr wins deterministically)
+        uses.insert(0x4000, [0, 999, 999, 999]); // never bound as RT
+
+        let ranked = rank_rt_candidates(&uses);
+        assert_eq!(ranked, vec![0xDEAD, 0x2000, 0x1000, 0x3000]);
+
+        let mut live_rtvs: HashMap<usize, usize> = HashMap::new();
+        live_rtvs.insert(1, 0x2000);
+        live_rtvs.insert(2, 0x3000);
+        live_rtvs.insert(3, 0x1000);
+
+        let mut inspected = Vec::new();
+        let chosen = pick_live_rt(&ranked, &live_rtvs, |r| {
+            inspected.push(r);
+            assert_ne!(r, 0xDEAD, "released resource not in RTVS must never be dereferenced");
+            (r != 0x2000).then_some(r)
+        });
+        assert_eq!(chosen, Some(0x1000));
+        assert_eq!(inspected, vec![0x2000, 0x1000]);
+
+        // If no live candidate is single-sampled, return None without touching dead entries.
+        let none = pick_live_rt(&ranked, &HashMap::from([(1, 0x2000)]), |r| {
+            assert_ne!(r, 0xDEAD);
+            None::<usize>
+        });
+        assert_eq!(none, None);
     }
 }
 

@@ -1953,6 +1953,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::present::forget_resource(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
