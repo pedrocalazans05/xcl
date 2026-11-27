@@ -1056,6 +1056,21 @@ unsafe fn submit_decoded_buffer(
             }
             bytes.into_boxed_slice()
         }
+        Ok(_) if !is_xma_voice => {
+            // A valid Opus buffer completely consumed by pre-skip produces 0 PCM frames.
+            // Windows XAudio2 rejects 0-byte SubmitSourceBuffer calls (XAUDIO2_E_INVALID_CALL),
+            // and substituting positive-duration silence would shift subsequent audio. Skip
+            // submitting audio frames and honor completion callbacks directly.
+            OPUS_BUFFERS_DECODED.fetch_add(1, Ordering::Relaxed);
+            if let Some((obj, vt)) = title_cb_vtbl(state.title_cb) {
+                ((*vt).buffer_start)(obj, orig_buf.context);
+                ((*vt).buffer_end)(obj, orig_buf.context);
+                if eos {
+                    ((*vt).stream_end)(obj);
+                }
+            }
+            return S_OK;
+        }
         res => {
             let err_counter = if is_xma_voice { &XMA_DECODE_ERRORS } else { &OPUS_DECODE_ERRORS };
             let codec_name = if is_xma_voice { "XMA" } else { "Opus" };
@@ -1201,6 +1216,9 @@ pub fn note_console_decode(packets: u64, errors: u64, frames: u64, nonzero: u64)
 mod tests {
     use super::*;
 
+    /// Serializes tests that assert exact deltas on process-global `AudioStats` counters.
+    static STATS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn xma2(channels: u16, rate: u32, samples: u32, bpb: u32, blocks: u16) -> Xma2WaveFormatEx {
         Xma2WaveFormatEx {
             wfx: WaveFormatEx { tag: WAVE_FORMAT_XMA2, channels, rate, avg_bytes: 0, block_align: 1, bits: 16, cb_size: 34 },
@@ -1333,6 +1351,7 @@ mod tests {
 
     #[test]
     fn opus_source_voice_decodes_and_manages_lifetime() {
+        let _stats_guard = STATS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if !opus::is_available() {
             eprintln!("skipping: MSOpusDecoder.dll not available");
             return;
@@ -1484,6 +1503,7 @@ mod tests {
 
     #[test]
     fn xma2_source_voice_decodes_and_manages_lifetime() {
+        let _stats_guard = STATS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::AtomicUsize;
 
         static ENDED: AtomicUsize = AtomicUsize::new(0);
@@ -1784,6 +1804,190 @@ mod tests {
             let sb2 = silent_buffer(&info, &buffer(0x100, 0, 0, 5000, 0, 1), sil.as_ptr(), sil.len());
             assert_eq!(submit(guard.voice, &sb2, std::ptr::null()), S_OK);
             assert_eq!(flush(guard.voice), S_OK);
+        }
+    }
+
+    #[test]
+    fn opus_preskip_only_packet_submits_zero_frames() {
+        let _stats_guard = STATS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !opus::is_available() {
+            eprintln!("skipping: MSOpusDecoder.dll not available");
+            return;
+        }
+        use std::sync::atomic::AtomicUsize;
+
+        // 1. Direct verification via spy SubmitSourceBufferFn: a 20 ms (960-frame) packet with
+        //    pre_skip = 960 decodes to Ok(empty) and must submit 0 audio bytes (0 frames), not
+        //    positive-duration silence.
+        static SUBMITTED_BYTES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn spy_submit(_this: *mut c_void, buf: *const XAudio2Buffer, _wma: *const c_void) -> HRESULT {
+            let b = buf.read_unaligned();
+            SUBMITTED_BYTES.lock().unwrap().push(b.audio_bytes);
+            assert_eq!({ b.play_begin }, 0);
+            assert_eq!({ b.play_length }, 0);
+            assert_eq!({ b.loop_begin }, 0);
+            assert_eq!({ b.loop_length }, 0);
+            assert_eq!({ b.loop_count }, 0);
+            assert!(!{ b.audio_data }.is_null());
+            S_OK
+        }
+
+        SUBMITTED_BYTES.lock().unwrap().clear();
+        let head = opus::build_opus_head(1, 48_000, 960, 0);
+        let dec = opus::Decoder::new(1, 48_000, &head).expect("Opus decoder init");
+        let state = DecodedVoiceState {
+            decoder: Mutex::new(VoiceDecoder::Opus(dec)),
+            block_align: 0,
+            channels: 1,
+            rate: 48_000,
+            avg_bytes: 4000,
+            title_cb: 0,
+            live_buffers: Mutex::new(HashMap::new()),
+        };
+
+        let pkt0 = opus::tests::MONO_HYBRID_20MS[0];
+        let pkt1 = opus::tests::MONO_HYBRID_20MS[1];
+        let b0 = XAudio2Buffer {
+            flags: 0,
+            audio_bytes: pkt0.len() as u32,
+            audio_data: pkt0.as_ptr(),
+            play_begin: 10,
+            play_length: 20,
+            loop_begin: 0,
+            loop_length: 10,
+            loop_count: 1,
+            context: 0xAA as *mut c_void,
+        };
+        let b1 = XAudio2Buffer {
+            flags: XAUDIO2_END_OF_STREAM,
+            audio_bytes: pkt1.len() as u32,
+            audio_data: pkt1.as_ptr(),
+            play_begin: 0,
+            play_length: 0,
+            loop_begin: 0,
+            loop_length: 0,
+            loop_count: 0,
+            context: 0xBB as *mut c_void,
+        };
+
+        let before = stats();
+        unsafe {
+            assert_eq!(submit_decoded_buffer(std::ptr::null_mut(), spy_submit, &state, b0), S_OK);
+        }
+        assert!(SUBMITTED_BYTES.lock().unwrap().is_empty(), "pre-skip-only packet must submit 0 frames (no SubmitSourceBuffer call)");
+        unsafe {
+            assert_eq!(submit_decoded_buffer(std::ptr::null_mut(), spy_submit, &state, b1), S_OK);
+        }
+        let after = stats();
+        let submitted = SUBMITTED_BYTES.lock().unwrap().clone();
+        assert_eq!(submitted, vec![960 * 2], "only the subsequent non-empty packet should submit 960 frames");
+        assert_eq!(after.opus_buffers_decoded, before.opus_buffers_decoded + 2);
+        assert_eq!(after.opus_decode_errors, before.opus_decode_errors);
+        assert_eq!(after.buffers_silenced, before.buffers_silenced);
+
+        // 2. End-to-end verification on real Windows XAudio2 2.9: submitting a pre-skip-only
+        //    packet followed by a real packet preserves completion callbacks and plays 0 frames
+        //    for the pre-skip-only packet.
+        static ENDED: AtomicUsize = AtomicUsize::new(0);
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        static STREAM_END: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "system" fn on_pass_start(_: *mut c_void, _: u32) {}
+        unsafe extern "system" fn on_nothing(_: *mut c_void) {}
+        unsafe extern "system" fn on_stream_end(_: *mut c_void) {
+            STREAM_END.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_buf_start(_: *mut c_void, ctx: *mut c_void) {
+            STARTED.fetch_add(ctx as usize, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_buf_end(_: *mut c_void, ctx: *mut c_void) {
+            ENDED.fetch_add(ctx as usize, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_loop(_: *mut c_void, _: *mut c_void) {}
+        unsafe extern "system" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+
+        static TEST_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
+            pass_start: on_pass_start,
+            pass_end: on_nothing,
+            stream_end: on_stream_end,
+            buffer_start: on_buf_start,
+            buffer_end: on_buf_end,
+            loop_end: on_loop,
+            voice_error: on_err,
+        };
+        #[repr(C)]
+        struct TestCb {
+            vtbl: &'static VoiceCallbackVtbl,
+        }
+        static TEST_CB: TestCb = TestCb { vtbl: &TEST_VTBL };
+
+        unsafe {
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(XAudio2Create(&mut eng, 0, 1), S_OK);
+            let vt_eng = vtable(eng);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            let mut master: *mut c_void = std::ptr::null_mut();
+            if create_master(eng, &mut master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+                release(eng);
+                eprintln!("skipping live XAudio2 portion: no audio device");
+                return;
+            }
+
+            let mut raw_fmt = Vec::with_capacity(18 + head.len());
+            let wfx = WaveFormatEx { tag: WAVE_FORMAT_OPUS, channels: 1, rate: 48_000, avg_bytes: 4000, block_align: 0, bits: 0, cb_size: head.len() as u16 };
+            raw_fmt.extend_from_slice(std::slice::from_raw_parts(&wfx as *const _ as *const u8, 18));
+            raw_fmt.extend_from_slice(&head);
+
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+            let mut voice: *mut c_void = std::ptr::null_mut();
+            let hr = create_src(eng, &mut voice, raw_fmt.as_ptr() as *const WaveFormatEx, 0, 2.0, &TEST_CB as *const _ as *mut c_void, std::ptr::null(), std::ptr::null());
+            assert_eq!(hr, S_OK, "CreateSourceVoice(Opus pre_skip) → {:#x}", hr as u32);
+
+            let vt_v = vtable(voice);
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vt_v.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let get_st: GetStateFn = std::mem::transmute(vt_v.add(VOICE_GET_STATE).read());
+            let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt_v.add(19).read());
+            let set_vol: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vt_v.add(12).read());
+            let destroy: DestroyVoiceFn = std::mem::transmute(vt_v.add(VOICE_DESTROY).read());
+
+            const CTX1: usize = 0x5005;
+            const CTX2: usize = 0x6006;
+            let live_b0 = XAudio2Buffer { flags: 0, audio_bytes: pkt0.len() as u32, audio_data: pkt0.as_ptr(), play_begin: 0, play_length: 0, loop_begin: 0, loop_length: 0, loop_count: 0, context: CTX1 as *mut c_void };
+            let live_b1 = XAudio2Buffer { flags: 0, audio_bytes: pkt1.len() as u32, audio_data: pkt1.as_ptr(), play_begin: 0, play_length: 0, loop_begin: 0, loop_length: 0, loop_count: 0, context: CTX2 as *mut c_void };
+
+            assert_eq!(submit(voice, &live_b0, std::ptr::null()), S_OK);
+            let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 99, samples_played: 99 };
+            get_st(voice, &mut st, 0);
+            assert_eq!({ st.buffers_queued }, 0, "pre-skip-only packet must not queue a silent buffer");
+            assert_eq!(STARTED.load(Ordering::SeqCst), CTX1);
+            assert_eq!(ENDED.load(Ordering::SeqCst), CTX1);
+
+            assert_eq!(submit(voice, &live_b1, std::ptr::null()), S_OK);
+            get_st(voice, &mut st, 0);
+            assert_eq!({ st.buffers_queued }, 1);
+            assert_eq!({ st.current_buffer_context } as usize, CTX2);
+
+            let _ = set_vol(voice, 0.0, 0);
+            assert_eq!(start(voice, 0, 0), S_OK);
+
+            let t0 = std::time::Instant::now();
+            while ENDED.load(Ordering::SeqCst) != CTX1 + CTX2
+                && t0.elapsed() < std::time::Duration::from_secs(3)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(STARTED.load(Ordering::SeqCst), CTX1 + CTX2);
+            assert_eq!(ENDED.load(Ordering::SeqCst), CTX1 + CTX2);
+            assert_eq!(STREAM_END.load(Ordering::SeqCst), 0);
+
+            get_st(voice, &mut st, 0);
+            assert_eq!({ st.samples_played }, 960, "only the post-pre-skip packet's 960 frames should be played");
+
+            destroy(voice);
+            destroy(master);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+            release(eng);
         }
     }
 }
