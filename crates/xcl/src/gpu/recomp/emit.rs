@@ -4577,11 +4577,11 @@ impl Em {
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
             let slot = if self.x64() {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_X_LDS_TOP)]")
             } else if self.safe_barrier {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_LDS_TOP)]")
             } else {
-                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+                format!("xcl_lds[min((({at}) >> 2) & 16383u, 8191u)]")
             };
             if name == "ds_write_addtid_b32" {
                 let src = self.vreg(f("DATA0"));
@@ -4605,11 +4605,11 @@ impl Em {
         let safe_bar = self.safe_barrier;
         let lds = |at: String| {
             if x64 {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_X_LDS_TOP)]")
             } else if safe_bar {
-                format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_LDS_TOP)]")
+                format!("xcl_lds[min((({at}) >> 2) & 16383u, XCL_LDS_TOP)]")
             } else {
-                format!("xcl_lds[(({at}) >> 2) & 8191u]")
+                format!("xcl_lds[min((({at}) >> 2) & 16383u, 8191u)]")
             }
         };
         let mut st = Vec::new();
@@ -5152,7 +5152,7 @@ impl Em {
                     let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
                     for (slot, r) in regs.iter().enumerate() {
                         for c in 0..4 {
-                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[min(((src + {}u) >> 2) & 16383u, 8191u)]);", 4 * slot + c, 16 * r + 4 * c as u32);
                         }
                     }
                     h.push_str("    }\n");
@@ -5231,7 +5231,7 @@ impl Em {
                 let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
                 for (slot, r) in regs.iter().enumerate() {
                     for c in 0..4 {
-                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[min(((src + {}u) >> 2) & 16383u, 8191u)]);", 4 * slot + c, 16 * r + 4 * c as u32);
                     }
                 }
                 h.push_str("    }\n");

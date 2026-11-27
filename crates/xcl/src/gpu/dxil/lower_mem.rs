@@ -2067,17 +2067,15 @@ impl Lw {
 
     // ------------------------------------------------------------ LDS / DS
 
-    /// LDS dword index of byte address `at` (`(at >> 2) & 8191`, below the exchange words
-    /// in the split form).
-    fn lds_index(&mut self, at: Value) -> Value {
+    /// LDS dword index of byte address `at` (`min((at >> 2) & 16383, lds_top)`).
+    /// Masks to the 64 KiB console LDS address space and clamps to `lds_top` (at most 8191,
+    /// the D3D12 32 KiB `groupshared` limit, or lower when split-wave64 exchange words sit
+    /// at the top) so offsets >= 32 KiB do not wrap around and alias offset 0.
+    pub(super) fn lds_index(&mut self, at: Value) -> Value {
         let i = self.lshrc(at, 2);
-        let i = self.andc(i, 8191);
-        if self.split {
-            let k = self.c(self.lds_top);
-            self.umin(i, k)
-        } else {
-            i
-        }
+        let i = self.andc(i, 16383);
+        let k = self.c(self.lds_top);
+        self.umin(i, k)
     }
     fn lds_ld(&mut self, at: Value) -> Value {
         let i = self.lds_index(at);
