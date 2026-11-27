@@ -6250,6 +6250,7 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
+        super::pso_async::note_amd_adapter(is_amd_device(this));
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
         if let Some(entry) = described {
             super::pso_async::on_first_use(*ppv as usize, Box::new(move || super::gfx_records::note(entry)));

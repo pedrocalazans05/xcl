@@ -612,10 +612,29 @@ mod used {
     }
 }
 
+/// Whether the active D3D12 device is an AMD adapter (set by `real.rs` before `submit_lazy`).
+static AMD_ADAPTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn note_amd_adapter(amd: bool) {
+    AMD_ADAPTER.store(amd, Ordering::Relaxed);
+}
+
+/// Whether speculative PSO preload is enabled for the given `XCL_PSO_PRELOAD` value and adapter.
+/// Explicit `"1"` enables, `"0"` disables; when unset, preload defaults to off on AMD adapters
+/// because background compilation of huge shaders can hang `amdxc64.dll`.
+fn preload_enabled(env: Option<&str>, amd: bool) -> bool {
+    match env.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => !amd,
+    }
+}
+
 /// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
-/// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
+/// (`XCL_PSO_PRELOAD=0`: off, `=1`: on; defaults to off on AMD adapters). Apart from the ones a
+/// bind sends to (`queue`) and at the lowest priority: a pipeline that is bound is not held up by
+/// the ones made ahead (whoever takes `job` first builds it), and the title's own threads are not
+/// either.
 struct Preload {
     list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
     cv: Condvar,
@@ -626,7 +645,12 @@ fn preload() -> Option<&'static Preload> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let q = Q
         .get_or_init(|| {
-            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
+            let env = std::env::var("XCL_PSO_PRELOAD").ok();
+            let amd = AMD_ADAPTER.load(Ordering::Relaxed);
+            if !preload_enabled(env.as_deref(), amd) {
+                if amd && env.as_deref().map(str::trim) != Some("0") {
+                    crate::xlog_info!("D3D12.X: speculative PSO preload disabled by default on AMD (set XCL_PSO_PRELOAD=1 to enable)");
+                }
                 return None;
             }
             Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
@@ -675,6 +699,19 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn preload_defaults_off_on_amd_unless_overridden() {
+        assert!(preload_enabled(None, false));
+        assert!(!preload_enabled(None, true));
+        assert!(preload_enabled(Some("1"), true));
+        assert!(preload_enabled(Some(" 1 "), true));
+        assert!(preload_enabled(Some("1"), false));
+        assert!(!preload_enabled(Some("0"), false));
+        assert!(!preload_enabled(Some(" 0 "), true));
+        assert!(!preload_enabled(Some(""), true));
+        assert!(preload_enabled(Some(""), false));
+    }
 
     /// The shaders of a set are kept when a pipeline of the set is used, each once, and not
     /// before: a set that is only made keeps nothing.

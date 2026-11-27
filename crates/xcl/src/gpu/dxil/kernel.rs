@@ -623,9 +623,12 @@ impl Lw {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
-        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+        } else if limit > 0
+            && (((numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32)
+                || (hw == 64 && matches!(numthreads, [64, 1, 1] | [32, 1, 1])))
+        {
             self.s.m.optimize();
-            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            dispatch_chain = self.s.split_compute(numthreads, hw, split_tid, limit).map(std::sync::Arc::new);
             self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
@@ -643,7 +646,7 @@ impl Lw {
 
 #[cfg(test)]
 #[test]
-fn dispatch_chain_native_wave64_builds_whole() {
+fn dispatch_chain_native_wave64_splits_and_matches_whole() {
     use crate::gpu::recomp::runner;
 
     let threads = [64, 1, 1];
@@ -669,11 +672,15 @@ fn dispatch_chain_native_wave64_builds_whole() {
     }
     lw.s.m.ret();
     lw.s.m.optimize();
-    // Exercise the native-wave admission gate with an otherwise partitionable CFG.
+    // Native Wave64 single-wave compute groups split into valid Wave64 DXIL pieces.
     assert!(lw.s.m.dispatch_plan(64).is_some());
     let program = lw.finish_dispatch(threads, 64, 64, None).unwrap();
-    assert!(program.dispatch_chain.is_none());
+    let chain = program.dispatch_chain.as_ref().expect("native wave64 single-wave group splits");
+    assert!(chain.pieces.len() >= 2);
     super::validate::validate(&program.dxil).expect("valid native wave64 whole shader");
+    for (i, piece) in chain.pieces.iter().enumerate() {
+        super::validate::validate(piece).unwrap_or_else(|e| panic!("valid native wave64 piece {i}: {e}"));
+    }
 
     if !runner::wave64_supported().unwrap_or(false) {
         runner::skip_test("no wave64");
@@ -681,8 +688,10 @@ fn dispatch_chain_native_wave64_builds_whole() {
     }
     let initial: Vec<u32> = (1..=64).collect();
     let expected: Vec<_> = initial.iter().map(|v| v + 40 * 64).collect();
-    let result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
-    assert_eq!(result, expected);
+    let whole_result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
+    assert_eq!(whole_result, expected);
+    let split_result = runner::dispatch_split(chain, [1, 1, 1], &initial).unwrap();
+    assert_eq!(split_result, expected);
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
