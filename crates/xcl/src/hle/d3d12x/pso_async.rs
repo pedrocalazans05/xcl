@@ -72,27 +72,64 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     Box::new(move || own)
 }
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "unknown panic"
+    }
+}
+
+/// Runs a pipeline build job, catching panics so a single bad shader neither kills a worker
+/// thread, unwinds across a COM hook, nor leaves waiting binds stalled forever.
+fn run_job(job: Job) -> usize {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+        Ok(real) => real,
+        Err(payload) => {
+            crate::xlog_error!("D3D12.X: panic while building pipeline: {}", panic_message(payload.as_ref()));
+            0
+        }
+    }
+}
+
+struct BuildGuard<'a> {
+    p: &'a Pending,
+    preload: bool,
+}
+
+impl Drop for BuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.preload {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+            // (under the lock: `want` does not raise this thread after it)
+            let mut d = self.p.demand.lock().unwrap();
+            d.preload_thread = 0;
+            if d.wanted {
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
+            }
+        }
+        BUILDING.with(|b| *b.borrow_mut() = None);
+    }
+}
+
 /// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
-    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
-    if preload {
-        let mut d = p.demand.lock().unwrap();
-        d.preload_thread = unsafe { GetCurrentThreadId() };
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL};
+    let real = {
+        BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+        let _guard = BuildGuard { p, preload };
+        if preload {
+            let mut d = p.demand.lock().unwrap();
+            d.preload_thread = unsafe { GetCurrentThreadId() };
+            if d.wanted {
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+            }
         }
-    }
-    complete(p, job());
-    if preload {
-        // (under the lock: `want` does not raise this thread after it)
-        let mut d = p.demand.lock().unwrap();
-        d.preload_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
-        }
-    }
-    BUILDING.with(|b| *b.borrow_mut() = None);
+        run_job(job)
+    };
+    complete(p, real);
 }
 
 impl Pending {
@@ -1134,6 +1171,143 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    /// A panicking worker build marks the pipeline failed, wakes waiting binds with the stand-in,
+    /// and keeps the worker pool alive for later pipelines.
+    #[test]
+    fn a_panicking_worker_build_wakes_waiters_and_keeps_workers_alive() {
+        let n = crate::gpu::recomp::dxc::compile_threads() + 2;
+        let base = 0x7E57_B100usize;
+        let failed_before = counts().1;
+        let (started_tx, started) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel();
+        submit(base, true, Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = go.recv();
+            panic!("simulated worker PSO panic");
+        }));
+        started.recv_timeout(std::time::Duration::from_secs(5)).expect("worker started first job");
+        let (wait_tx, wait_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = wait_tx.send(resolve_wait_for(base, None));
+        });
+        let t = std::time::Instant::now();
+        while !entry(base).is_some_and(|p| p.demand.lock().unwrap().wanted) && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = go_tx.send(());
+        let resolved = wait_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("waiting bind woke after worker panic");
+        assert_eq!(resolved, base, "panicked build falls back to the stand-in");
+        assert!(!is_pending(base));
+        for i in 1..n {
+            submit(base + i, false, Box::new(|| panic!("simulated worker PSO panic")));
+        }
+        let start = std::time::Instant::now();
+        while (1..n).any(|i| is_pending(base + i)) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for i in 0..n {
+            assert!(!is_pending(base + i), "panicked job {i} completed");
+            let _ = released(base + i);
+        }
+        assert!(counts().1 >= failed_before + n, "failed count incremented for panicked jobs");
+
+        // `resolve_wait_for` with a budget dispatches only to the worker pool (never inline),
+        // so this succeeds only if workers survived more panics than the pool size.
+        let after = 0x7E57_B1FFusize;
+        submit(after, true, Box::new(|| 0x5555));
+        assert_eq!(resolve_wait_for(after, Some(std::time::Duration::from_secs(5))), 0x5555, "worker pool still builds pipelines after panics");
+        let _ = released(after);
+    }
+
+    /// A panicking preload build clears its preload thread state, wakes any waiting bind, and
+    /// leaves the preload workers alive at their low priority.
+    #[test]
+    fn a_panicking_preload_build_restores_state_and_keeps_preloaders_alive() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_LOWEST};
+        let panic_key = 0x5EED_B210u64;
+        let after_key = 0x5EED_B211u64;
+        used::earlier_run_used(panic_key);
+        used::earlier_run_used(after_key);
+
+        let first = 0x7E57_B200usize;
+        let (started_tx, started) = mpsc::channel();
+        submit_lazy(first, true, Box::new(move || {
+            let _ = started_tx.send(());
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("simulated preload PSO panic");
+        }), panic_key);
+        started.recv_timeout(std::time::Duration::from_secs(5)).expect("preload worker started job");
+        let (wait_tx, wait_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = wait_tx.send(resolve_wait_for(first, None));
+        });
+        let resolved = wait_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("waiting bind woke after preload panic");
+        assert_eq!(resolved, first);
+        assert!(!is_pending(first));
+        assert_eq!(entry(first).unwrap().demand.lock().unwrap().preload_thread, 0, "preload_thread cleared after panic");
+        let _ = released(first);
+
+        // More panics than the 2..=4 preload workers: all workers would be gone if uncaught.
+        for i in 1..=5usize {
+            submit_lazy(first + i, false, Box::new(|| panic!("simulated preload PSO panic")), panic_key);
+        }
+        let start = std::time::Instant::now();
+        while (1..=5usize).any(|i| is_pending(first + i)) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for i in 1..=5usize {
+            assert!(!is_pending(first + i), "panicked preload job {i} completed");
+            let _ = released(first + i);
+        }
+
+        let after = 0x7E57_B210usize;
+        submit_lazy(after, false, Box::new(|| {
+            let prio = unsafe { GetThreadPriority(GetCurrentThread()) };
+            if !build_is_wanted() && prio == THREAD_PRIORITY_LOWEST { 0x6666 } else { 0 }
+        }), after_key);
+        let start = std::time::Instant::now();
+        while is_pending(after) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(after), "preload worker built follow-up pipeline without a bind");
+        assert_eq!(resolve(after), 0x6666, "preload worker kept lowest priority and clean BUILDING state");
+        let _ = released(after);
+    }
+
+    /// A panicking inline build in `resolve_wait_for` returns the stand-in instead of unwinding
+    /// across a COM hook or leaving concurrent waiters blocked.
+    #[test]
+    fn a_panicking_inline_bind_build_does_not_unwind_or_hang_waiters() {
+        let standin = 0x7E57_B300usize;
+        let (started_tx, started) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = started_tx.send(());
+            let t = std::time::Instant::now();
+            while !entry(standin).is_some_and(|p| p.demand.lock().unwrap().wanted) && t.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("simulated inline bind PSO panic");
+        }), 0);
+        let (a_tx, a_rx) = mpsc::channel();
+        let a = std::thread::spawn(move || {
+            let _ = a_tx.send(resolve_wait_for(standin, None));
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).expect("bind thread started inline build");
+        let (b_tx, b_rx) = mpsc::channel();
+        let b = std::thread::spawn(move || {
+            let _ = b_tx.send(resolve_wait_for(standin, None));
+        });
+        assert_eq!(a_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("inline builder returned"), standin);
+        assert_eq!(b_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("concurrent waiter woke"), standin);
+        a.join().expect("inline builder did not unwind");
+        b.join().expect("concurrent waiter did not panic");
+        assert!(!is_pending(standin));
+        let _ = released(standin);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1196,7 +1370,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(&p, run_job(job));
     }
     p.want();
     let mut done = p.done.lock().unwrap();
