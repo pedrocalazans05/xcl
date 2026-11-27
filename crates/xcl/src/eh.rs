@@ -554,14 +554,38 @@ unsafe extern "C" fn invalid_parameter(_expr: *const u16, _function: *const u16,
     }
 }
 
+/// True when `addr` lies in a committed, executable memory page (excluding guard/no-access pages).
+/// Used by stack scanning to reject pointers into non-executable module data (`.rdata`, `.pdata`,
+/// `.data`, PE headers, heap, or stack).
+unsafe fn is_executable_addr(addr: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+    };
+    if addr < 0x10000 {
+        return false;
+    }
+    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(addr as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
+        return false;
+    }
+    if mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0 {
+        return false;
+    }
+    matches!(
+        mbi.Protect & 0xFF,
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
 /// Return addresses into loaded modules (not the system's D3D12 / ntdll / kernel ones) among
 /// the first 512 stack slots from `rsp`: the calls that led to a crash (heuristic: values on
-/// the stack that point into code).
+/// the stack that point into committed executable code).
 unsafe fn stack_callers(rsp: usize) -> String {
     stack_callers_n(rsp, 6)
 }
 
-/// `stack_callers` with up to `max` callers.
+/// `stack_callers` with up to `max` scanned executable-code candidates.
 unsafe fn stack_callers_n(rsp: usize, max: usize) -> String {
     let mut callers = Vec::new();
     for k in 0..512usize {
@@ -569,7 +593,11 @@ unsafe fn stack_callers_n(rsp: usize, max: usize) -> String {
         if !crate::gpu::shader::readable(at, 8) {
             break;
         }
-        let d = modules::describe_address((at as *const usize).read_unaligned());
+        let addr = (at as *const usize).read_unaligned();
+        if !is_executable_addr(addr) {
+            continue;
+        }
+        let d = modules::describe_address(addr);
         if d.contains('+') && !d.starts_with("D3D12") && !d.starts_with("ntdll") && !d.starts_with("KERNEL") && !d.ends_with("+0x0") {
             callers.push(d);
             if callers.len() == max {
@@ -577,7 +605,11 @@ unsafe fn stack_callers_n(rsp: usize, max: usize) -> String {
             }
         }
     }
-    callers.join(", ")
+    if callers.is_empty() {
+        String::new()
+    } else {
+        format!("scanned: {}", callers.join(", "))
+    }
 }
 
 #[link(name = "kernel32")]
@@ -1399,6 +1431,70 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn stack_callers_rejects_non_executable_module_data_and_accepts_code() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        };
+        unsafe {
+            // Synthetic 3-page module: page 0 = .rdata (RO), page 1 = .text (RX), page 2 = .data (RW).
+            let img = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(img, 0);
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(img as *const _, 0x1000, PAGE_READONLY, &mut old), 0);
+            assert_ne!(VirtualProtect((img + 0x1000) as *const _, 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+
+            assert!(!is_executable_addr(0));
+            assert!(!is_executable_addr(img + 0x123));
+            assert!(is_executable_addr(img + 0x1040));
+            assert!(!is_executable_addr(img + 0x2080));
+
+            // Guarded executable page must also be rejected.
+            assert_ne!(VirtualProtect((img + 0x2000) as *const _, 0x1000, PAGE_EXECUTE_READ | PAGE_GUARD, &mut old), 0);
+            assert!(!is_executable_addr(img + 0x2080));
+            assert_ne!(VirtualProtect((img + 0x2000) as *const _, 0x1000, PAGE_READWRITE, &mut old), 0);
+
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "scan_test.exe".into(),
+                path: "scan_test.exe".into(),
+                base: img,
+                size: 0x3000,
+                entry_rva: 0x1000,
+                is_dll: false,
+                exports: Default::default(),
+                tls_callbacks: Mutex::new(Vec::new()),
+                no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true),
+                stack_reserve: 0,
+            }));
+
+            // Place the synthetic stack at the end of a committed page followed by a reserved
+            // (uncommitted) page so stack_callers_n scans only these exact 6 words.
+            let stack_region = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(stack_region, 0);
+            assert_ne!(VirtualAlloc(stack_region as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            let words: [usize; 6] = [
+                0,
+                img + 0x0123, // .rdata (PAGE_READONLY) -> reject
+                img + 0x1040, // .text  (PAGE_EXECUTE_READ) -> accept
+                img + 0x2080, // .data  (PAGE_READWRITE) -> reject
+                img + 0x1080, // .text  (PAGE_EXECUTE_READ) -> accept
+                0xdead_beef,
+            ];
+            let rsp = stack_region + 0x1000 - std::mem::size_of_val(&words);
+            std::ptr::copy_nonoverlapping(words.as_ptr(), rsp as *mut usize, words.len());
+
+            let out = stack_callers_n(rsp, 6);
+            assert_eq!(out, "scanned: scan_test.exe+0x1040, scan_test.exe+0x1080");
+
+            modules::unregister_mapped(img);
+            VirtualFree(stack_region as *mut _, 0, MEM_RELEASE);
+            VirtualFree(img as *mut _, 0, MEM_RELEASE);
         }
     }
 }
