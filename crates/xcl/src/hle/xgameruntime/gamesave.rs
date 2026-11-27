@@ -680,19 +680,24 @@ fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -
             None
         };
 
-        let step_res = match op {
-            StagedOp::Write { dest, tmp } => replace_file(tmp, dest),
+        let step_res: Result<(), HRESULT> = match op {
+            StagedOp::Write { dest, tmp } => replace_file(tmp, dest).map_err(|_| crate::util::E_FAIL),
             StagedOp::Delete { dest } => match std::fs::remove_file(dest) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
+                Err(e) => Err(e
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                    .filter(|&code| code != 0)
+                    .map(crate::util::hresult_from_win32)
+                    .unwrap_or(crate::util::E_FAIL)),
             },
         };
 
-        if step_res.is_err() {
+        if let Err(hr) = step_res {
             cleanup_staged(&staged[idx..]);
             rollback_changes(rollback_log);
-            return crate::util::E_FAIL;
+            return hr;
         }
 
         if let Some(prev) = prev {
@@ -1391,6 +1396,47 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Save v2");
         assert_eq!(std::fs::read(blobs_dir.join(enc("first"))).unwrap(), b"v2-first");
         assert_eq!(std::fs::read(&second_path).unwrap(), b"v2-second");
+    }
+
+    #[test]
+    fn blob_delete_succeeds_when_missing_and_fails_when_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-gamesave-delete-err-{}-{nonce}", std::process::id())));
+        let dir = root.0.join("slot");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Deleting a non-existent blob is a no-op and returns S_OK.
+        assert_eq!(apply(&dir, None, &[("missing".into(), None)]), S_OK);
+
+        // Seed a blob and hold an open handle without FILE_SHARE_DELETE so remove_file fails.
+        assert_eq!(apply(&dir, None, &[("locked".into(), Some(b"keep".to_vec()))]), S_OK);
+        let blob_path = dir.join("b").join(enc("locked"));
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&blob_path)
+            .unwrap();
+
+        let hr = apply(&dir, None, &[("locked".into(), None)]);
+        assert!(hr < 0, "locked blob delete must fail, got {hr:#x}");
+        assert_eq!(hr, crate::util::hresult_from_win32(ERROR_SHARING_VIOLATION));
+        assert_eq!(std::fs::read(&blob_path).unwrap(), b"keep");
+
+        // Releasing the handle allows deletion to succeed.
+        drop(held);
+        assert_eq!(apply(&dir, None, &[("locked".into(), None)]), S_OK);
+        assert!(!blob_path.exists());
     }
 
 }
