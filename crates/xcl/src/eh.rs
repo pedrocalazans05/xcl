@@ -691,9 +691,23 @@ unsafe fn frame_reach(base: u64, f: &windows_sys::Win32::System::Diagnostics::De
         let (version, flags, count) = (*p & 7, *p >> 3, *p.add(2) as usize);
         let codes = p.add(4) as *const u16;
         let slot = |k: usize| codes.add(k).read_unaligned() as u64;
+        // a chained (earlier) part's saves are relative to its RSP: above what the later part's
+        // codes pushed and allocated
+        let shift = reach - 8;
         let mut i = 0;
         while i < count {
             let (code_at, op, op_info) = (slot(i) & 0xFF, (slot(i) >> 8) & 15, slot(i) >> 12);
+            // (the slots a code takes, all of them within the codes: unwind data that runs past
+            // its count is not followed)
+            let slots = match op {
+                1 if op_info == 0 => 2,
+                1 | 5 | 9 => 3,
+                4 | 8 => 2,
+                _ => 1,
+            };
+            if i + slots > count {
+                return None;
+            }
             match op {
                 0 => (reach, i) = (reach + 8, i + 1),                               // PUSH_NONVOL
                 1 if op_info == 0 => (reach, i) = (reach + slot(i + 1) * 8, i + 2), // ALLOC_LARGE
@@ -701,19 +715,23 @@ unsafe fn frame_reach(base: u64, f: &windows_sys::Win32::System::Diagnostics::De
                 2 => (reach, i) = (reach + op_info * 8 + 8, i + 1),                 // ALLOC_SMALL
                 3 => {
                     // SET_FPREG: RSP comes from the frame register once the prologue has set
-                    // it; the codes of an earlier (chained) part of the function all apply
+                    // it; the codes of an earlier (chained) part of the function all apply. One
+                    // with no frame register named is not followed.
+                    let reg = *p.add(3);
+                    if reg & 15 == 0 {
+                        return None;
+                    }
                     if depth > 0 || at >= code_at {
-                        let reg = *p.add(3);
                         fp = Some(((reg & 15) as usize, (reg >> 4) as u64 * 16));
                     }
                     i += 1
                 }
-                4 => (saved, i) = (saved.max(slot(i + 1) * 8 + 8), i + 2),          // SAVE_NONVOL
-                5 => (saved, i) = (saved.max((slot(i + 1) | slot(i + 2) << 16) + 8), i + 3),
-                6 if version == 2 => i += 1,                                        // EPILOG: no stack
-                8 => (saved, i) = (saved.max(slot(i + 1) * 16 + 16), i + 2),        // SAVE_XMM128
-                9 => (saved, i) = (saved.max((slot(i + 1) | slot(i + 2) << 16) + 16), i + 3),
-                10 => (reach, i) = (reach + 6 * 8, i + 1),                          // PUSH_MACHFRAME
+                4 => (saved, i) = (saved.max(shift + slot(i + 1) * 8 + 8), i + 2),          // SAVE_NONVOL
+                5 => (saved, i) = (saved.max(shift + (slot(i + 1) | slot(i + 2) << 16) + 8), i + 3),
+                6 if version == 2 => i += 1,                                                // EPILOG: no stack
+                8 => (saved, i) = (saved.max(shift + slot(i + 1) * 16 + 16), i + 2),        // SAVE_XMM128
+                9 => (saved, i) = (saved.max(shift + (slot(i + 1) | slot(i + 2) << 16) + 16), i + 3),
+                10 => (reach, i) = (reach + 6 * 8, i + 1),                                  // PUSH_MACHFRAME
                 _ => return None,
             }
         }
@@ -1186,6 +1204,20 @@ mod tests {
             // the chained part: its 0x1000 and the whole first part, whose frame register is set
             let g = entry(0x50, 0x200);
             assert_eq!(frame_reach(base, &g, base + 0x50), Some((Some((5, 0x20)), 0x1040)));
+            // a chained part whose earlier part saves rbx at [rsp + 0x80]: that RSP is above the
+            // later part's 0x1000, so the save is at 0x1080 from the frame's RSP
+            let parent: Vec<u8> = [vec![1, 4, 2, 0], code(4, 4, 3).to_vec(), vec![0x10, 0x00]].concat();
+            image[0x340..0x340 + parent.len()].copy_from_slice(&parent);
+            let child: Vec<u8> = [vec![1 | 4 << 3, 7, 2, 0], code(7, 1, 0).to_vec(), vec![0x00, 0x02], 0x60u32.to_le_bytes().to_vec(), 0x70u32.to_le_bytes().to_vec(), 0x340u32.to_le_bytes().to_vec()].concat();
+            image[0x380..0x380 + child.len()].copy_from_slice(&child);
+            let h = entry(0x80, 0x380);
+            let reached = frame_reach(base, &h, base + 0x80);
+            assert_eq!(reached, Some((None, 0x1000 + 0x80 + 8)), "{reached:x?}");
+            // a code whose slots run past the count, and a frame register code with none named
+            image[0x3a0..0x3a6].copy_from_slice(&[&[1u8, 4, 1, 0][..], &code(4, 1, 0)[..]].concat());
+            assert_eq!(frame_reach(base, &entry(0x90, 0x3a0), base + 0x90), None);
+            image[0x3c0..0x3c6].copy_from_slice(&[&[1u8, 4, 1, 0][..], &code(4, 3, 0)[..]].concat());
+            assert_eq!(frame_reach(base, &entry(0xa0, 0x3c0), base + 0xa0 + 8), None);
             // unwind codes it does not know
             image[0x105] = 7;
             assert_eq!(frame_reach(base, &f, base + 0x10 + 20), None);
