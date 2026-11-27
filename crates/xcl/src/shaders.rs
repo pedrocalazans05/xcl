@@ -1842,11 +1842,15 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
     progress.workers.store(workers, Ordering::Relaxed);
     let counts: Vec<AtomicUsize> = (0..workers).map(|_| AtomicUsize::new(0)).collect();
     let summaries: Vec<Mutex<String>> = (0..workers).map(|_| Mutex::new(String::new())).collect();
+    let mut failed = 0;
     let mut children = Vec::new();
     for i in 0..workers {
         match command(i).spawn() {
             Ok(child) => children.push((i, child)),
-            Err(e) => crate::xlog_warn!("Shader preparation: worker {i} did not start: {e}"),
+            Err(e) => {
+                failed += 1;
+                crate::xlog_warn!("Shader preparation: worker {i} did not start: {e}");
+            }
         }
     }
     let cancelled = std::thread::scope(|s| {
@@ -1878,7 +1882,6 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
-    let mut failed = 0;
     for (i, child) in children.iter_mut() {
         match child.wait() {
             Ok(st) if st.success() => {}
@@ -1890,6 +1893,42 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
     progress.total.store(total_before, Ordering::Relaxed);
     progress.done.store(done_before, Ordering::Relaxed);
     (cancelled, failed, summaries.into_iter().map(|s| s.into_inner().unwrap()).collect())
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_failures_are_counted_in_worker_failure_total() {
+        let progress = LaunchPreparation::default();
+        let missing = std::env::temp_dir().join(format!("xcl_no_such_worker_{}.exe", std::process::id()));
+        let (cancelled, failed, summaries) = in_workers(2, 10, &progress, |_| std::process::Command::new(&missing));
+        assert!(!cancelled);
+        assert_eq!(failed, 2, "both unstarted workers must be counted as failed");
+        assert_eq!(summaries.len(), 2);
+    }
+
+    #[test]
+    fn partial_spawn_failure_counts_only_failed_workers() {
+        let progress = LaunchPreparation::default();
+        let missing = std::env::temp_dir().join(format!("xcl_no_such_worker_partial_{}.exe", std::process::id()));
+        let (cancelled, failed, summaries) = in_workers(2, 10, &progress, |i| {
+            if i == 0 {
+                let mut c = std::process::Command::new("cmd.exe");
+                c.args(["/C", "exit", "0"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped());
+                c
+            } else {
+                std::process::Command::new(&missing)
+            }
+        });
+        assert!(!cancelled);
+        assert_eq!(failed, 1, "one succeeded and one failed to spawn");
+        assert_eq!(summaries.len(), 2);
+    }
 }
 
 /// The graphics pipelines earlier runs used (`gfx_records`), built before the title starts by
