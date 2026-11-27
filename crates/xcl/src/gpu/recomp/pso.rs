@@ -976,7 +976,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT", "XCL_SAFE_BARRIER"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -1263,7 +1263,7 @@ fn console_mesh_with(
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
     let split = wave64 && split_wave64;
-    let w64_only = !wave64 && wave64_only;
+    let w64_only = wave64_only && !split;
     let wave_mode = if split { 1u8 } else if w64_only { 2u8 } else { 0u8 };
     let compile_one = || compile(code, ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk

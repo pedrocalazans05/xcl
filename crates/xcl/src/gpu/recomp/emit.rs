@@ -691,7 +691,7 @@ impl Em {
         self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
         self.safe_barrier = has_s_barrier
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
-            && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
+            && safe_barrier_enabled(self.opt.hw_wave);
     }
 
     pub fn take(&mut self) -> String {
@@ -6261,6 +6261,25 @@ uint2 xcl_x_ballot_local(bool b) {
 // DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
+
+/// Whether multi-wave Compute / Mesh `s_barrier` uses the emulated LDS spin-barrier
+/// (`PRELUDE_SAFE_BARRIER`) instead of native `GroupMemoryBarrierWithGroupSync()`.
+///
+/// Explicit `XCL_SAFE_BARRIER=0` / `1` always wins. Otherwise, wave64-only GPUs (`hw_wave == 64`,
+/// i.e. AMD GCN/Polaris/Vega) default to native `GroupMemoryBarrierWithGroupSync()`, which
+/// compiles to hardware `s_barrier` with native early-`s_endpgm` wave-count tracking and avoids
+/// Polaris LDS-atomic spin starvation / TDRs on multi-barrier reductions. NVIDIA and Wave32-capable
+/// GPUs keep the early-exit-safe spin barrier by default.
+pub(crate) fn safe_barrier_enabled(hw_wave: u32) -> bool {
+    safe_barrier_enabled_with(hw_wave, std::env::var("XCL_SAFE_BARRIER").ok().as_deref())
+}
+
+pub(crate) fn safe_barrier_enabled_with(hw_wave: u32, env: Option<&str>) -> bool {
+    match env {
+        Some(v) => v.trim() != "0",
+        None => hw_wave != 64,
+    }
+}
 
 /// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`.
 ///

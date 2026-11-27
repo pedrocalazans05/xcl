@@ -32,10 +32,9 @@ fn wave64_hardware() -> bool {
 }
 
 /// `o` for a program run on this adapter (the split wave64 form where it is needed,
-/// or `hw_wave = 64` for wave32 compute/mesh programs on wave64-only GPUs like Polaris).
+/// or `hw_wave = 64` for compute/mesh programs on wave64-only GPUs like Polaris).
 fn on_gpu(o: Options) -> Options {
     let hw_wave = if o.hw_wave == 0
-        && !o.wave64
         && matches!(o.mode, Mode::Compute(_) | Mode::Mesh(_))
         && runner::wave32_supported() == Ok(false)
     {
@@ -9240,16 +9239,20 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
     for wave64 in [true, false] {
-        let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        let opt = on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() });
+        let t = translate(&p_all, &opt).unwrap();
         assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
-        if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
+        if super::emit::safe_barrier_enabled(opt.hw_wave) {
             assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
+        } else {
+            assert!(!t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected native barrier on wave64-only GPU");
+            assert!(t.hlsl.contains("GroupMemoryBarrierWithGroupSync();"), "wave64={wave64}: expected GroupMemoryBarrierWithGroupSync()");
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
         for tid in 0..128usize {
             let want = ((tid ^ 96) + 0x101) as u32;
-            assert_eq!(out[(base + tid * 4) / 4], want, "wave64={wave64} tid={tid}: 2-gen xcl_s_barrier LDS exchange");
+            assert_eq!(out[(base + tid * 4) / 4], want, "wave64={wave64} tid={tid}: 2-gen s_barrier LDS exchange");
         }
     }
 
@@ -9286,6 +9289,35 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
     for tid in 64..128usize {
         assert_eq!(out[(base + tid * 4) / 4], 0, "tid={tid}: exited wave must not store");
+    }
+}
+
+#[test]
+fn safe_barrier_default_off_on_wave64_only_and_env_override() {
+    use super::emit::safe_barrier_enabled_with;
+    // Default: enabled on Wave32-capable / NVIDIA GPUs (hw_wave == 0), disabled on wave64-only (hw_wave == 64)
+    assert!(safe_barrier_enabled_with(0, None));
+    assert!(safe_barrier_enabled_with(32, None));
+    assert!(!safe_barrier_enabled_with(64, None));
+    // Explicit env overrides always win
+    assert!(safe_barrier_enabled_with(64, Some("1")));
+    assert!(!safe_barrier_enabled_with(0, Some("0")));
+    assert!(!safe_barrier_enabled_with(0, Some(" 0 ")));
+
+    // Emitter check: multi-wave compute shader with S_BARRIER
+    let mut code = encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let cs = super::CsInterface { threads: [256, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+
+    let t_w64_only = translate(&code, &Options { mode: Mode::Compute(cs.clone()), wave64: true, hw_wave: 64, ..Default::default() }).unwrap();
+    assert!(t_w64_only.complete());
+    if std::env::var_os("XCL_SAFE_BARRIER").is_none() {
+        assert!(!t_w64_only.hlsl.contains("xcl_s_barrier();"), "wave64-only must emit native barrier by default");
+        assert!(t_w64_only.hlsl.contains("GroupMemoryBarrierWithGroupSync();"));
+
+        let t_default = translate(&code, &Options { mode: Mode::Compute(cs), wave64: true, hw_wave: 0, ..Default::default() }).unwrap();
+        assert!(t_default.complete());
+        assert!(t_default.hlsl.contains("xcl_s_barrier();"), "default hw_wave=0 must keep safe_barrier");
     }
 }
 
