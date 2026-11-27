@@ -144,22 +144,24 @@ pub fn created_on(list: usize, raw: usize, ty: i32) {
     *s.recordings.entry(list).or_default() += 1;
 }
 
-/// Diagnostic (#1452): `lists` are about to be submitted to `queue`. A PC list whose previous
-/// submit the GPU has not finished must not be submitted again on the PC (debug layer id 553,
-/// "the command queue fence has not advanced past previous executions of the command list");
-/// a console lets a title do it. Logged (the first 8, then at powers of two) with whether it is
-/// the same recording and the same queue. Every submitted PC list is seen (`executed` marks them all).
-pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize {
+/// Bounded CPU wait before resubmitting a command list whose previous execution is still on the GPU.
+const RESUBMIT_WAIT_MS: u32 = 5_000;
+
+/// Collect `(fence, value)` marks for any PC list in `lists` whose previous submit is still
+/// running on the GPU, logging diagnostics (first 8, then powers of two).
+unsafe fn collect_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> (usize, Vec<(ID3D12Fence, u64)>) {
     if !enabled() {
-        return 0;
+        return (0, Vec::new());
     }
     let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return 0 };
+    let Some(s) = g.as_mut() else { return (0, Vec::new()) };
     let mut found = 0;
+    let mut pending: Vec<(ID3D12Fence, u64)> = Vec::new();
     for &l in lists {
         let l = l as usize;
         let Some(last) = s.last_submit.get(&l) else { continue };
-        if last.fence.GetCompletedValue() >= last.value {
+        let completed = last.fence.GetCompletedValue();
+        if completed >= last.value || completed == u64::MAX {
             continue;
         }
         let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
@@ -169,10 +171,52 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
         let n = s.resubmits;
         if n <= 8 || n.is_power_of_two() {
             crate::xlog_warn!(
-                "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – the PC does not allow it (debug layer id 553)",
+                "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – waiting for previous execution before resubmitting (debug layer id 553)",
                 if same_recording { "the same recording" } else { "a new recording" },
                 if same_queue { "the same queue" } else { "another queue" },
             );
+        }
+        let raw = last.fence.as_raw();
+        if let Some((_, v)) = pending.iter_mut().find(|(f, _)| f.as_raw() == raw) {
+            *v = (*v).max(last.value);
+        } else {
+            pending.push((last.fence.clone(), last.value));
+        }
+    }
+    (found, pending)
+}
+
+/// Diagnostic (#1452): `lists` are about to be submitted to `queue`. A PC list whose previous
+/// submit the GPU has not finished must not be submitted again on the PC (debug layer id 553,
+/// "the command queue fence has not advanced past previous executions of the command list");
+/// a console lets a title do it. Logged (the first 8, then at powers of two) with whether it is
+/// the same recording and the same queue. Every submitted PC list is seen (`executed` marks them all).
+#[cfg(test)]
+pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize {
+    collect_resubmits(queue, lists).0
+}
+
+/// Wait until any previous GPU execution of a PC command list in `lists` has completed before
+/// submitting `lists` again, avoiding D3D12 debug layer ID 553 / AMD DEVICE_HUNG.
+/// Returns the number of in-flight list resubmits detected.
+pub unsafe fn wait_for_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize {
+    use crate::gpu::fence::{self, FenceError};
+
+    let (found, pending) = collect_resubmits(queue, lists);
+    if pending.is_empty() {
+        return found;
+    }
+    for (fence, value) in pending {
+        let mut dev: Option<ID3D12Device> = None;
+        let Some(dev) = fence.GetDevice(&mut dev).ok().and(dev) else {
+            continue;
+        };
+        if let Err(e) = fence::wait(&fence, value, &dev, None, RESUBMIT_WAIT_MS) {
+            crate::xlog_warn!("D3D12.X: waiting for in-flight command list before resubmit: {e}");
+            if matches!(e, FenceError::Removed(_)) {
+                super::real::log_device_removed();
+                break;
+            }
         }
     }
     found
@@ -579,6 +623,45 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    /// Resubmitting the same closed recording while its prior submit is still pending on the GPU
+    /// waits for the in-flight fence to reach the prior submit's value before returning.
+    #[test]
+    fn wait_for_resubmits_blocks_until_prior_submit_fence_completes() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 2]);
+            let (alloc, list) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+            let queue = 0x20usize as *mut c_void;
+            created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let recording = s.recordings[&list];
+                s.last_submit.insert(list, LastSubmit { queue: queue as usize, fence: fence.clone(), value: 1, recording });
+            }
+
+            let signal_fence = fence.clone();
+            let signaler = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                signal_fence.Signal(1).unwrap();
+            });
+
+            let waited = wait_for_resubmits(queue, &[list as *mut c_void]);
+            let completed = fence.GetCompletedValue();
+            let after_done = wait_for_resubmits(queue, &[list as *mut c_void]);
+            signaler.join().unwrap();
+            forget_list(list);
+            forget(alloc);
+
+            assert_eq!(waited, 1, "must detect and wait on the pending resubmit");
+            assert!(completed >= 1, "in-flight fence must have completed before returning");
+            assert_eq!(after_done, 0, "once completed, no further wait is needed");
         }
     }
 }
