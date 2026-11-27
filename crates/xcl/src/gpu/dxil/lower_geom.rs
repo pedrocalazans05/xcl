@@ -203,8 +203,7 @@ impl Lw {
                 let mut vals = [z; 4];
                 for c in 0..4u32 {
                     let a = lw.addc(src, 16 * r + 4 * c);
-                    let i = lw.lshrc(a, 2);
-                    let i = lw.andc(i, 8191);
+                    let i = lw.lds_index(a);
                     vals[c as usize] = lw.s.gs_load(lds, i);
                 }
                 let o = lw.addc(dst, 4 * slot as u32);

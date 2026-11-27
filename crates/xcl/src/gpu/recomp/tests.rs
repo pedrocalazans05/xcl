@@ -10366,3 +10366,39 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_lds_offset_32k_does_not_alias_zero() {
+    let code = prog(&[
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 2), ("DATA0", 3), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 0), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 2), ("OFFSET0", 0), ("OFFSET1", 0)], None),
+    ]);
+    let t = super::translate(&code, &super::Options::default()).unwrap();
+    assert!(t.hlsl.contains("& 16383u"), "HLSL must mask to 64 KiB before clamping: {}", t.hlsl);
+    assert!(!t.hlsl.contains("& 8191u"), "HLSL must not wrap 32 KiB offsets with & 8191u: {}", t.hlsl);
+
+    if !gpu_ready() {
+        return;
+    }
+    let opt = runner::options(super::Mode::Kernel);
+    let t_gpu = super::translate(&code, &opt).unwrap();
+    let dxil_hlsl = super::dxc::compile(&t_gpu.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_direct = runner::direct_kernel(&code, true).unwrap();
+
+    let mut st = KernelState::default();
+    for r in &mut st.vgpr {
+        r[0] = 0; // byte offset 0
+        r[1] = 0x1111_2222;
+        r[2] = 32768; // byte offset 32 KiB
+        r[3] = 0x3333_4444;
+    }
+
+    for (tag, dxil) in [("hlsl", &dxil_hlsl), ("direct", &dxil_direct)] {
+        let r = runner::run(dxil, &st, &[]).unwrap();
+        assert_eq!(r.vgpr[0][4], 0x1111_2222, "{tag}: LDS offset 0 must not be overwritten by offset 32768");
+        assert_eq!(r.vgpr[0][5], 0x3333_4444, "{tag}: LDS offset 32768 must read back its distinct value");
+    }
+}
