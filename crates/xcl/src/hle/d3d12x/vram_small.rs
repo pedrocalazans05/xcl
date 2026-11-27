@@ -44,6 +44,8 @@ struct Pool<H> {
     heap: H,
     /// Bump pointer in 4 KiB units (`0..=POOL_UNITS`).
     next_unit: u32,
+    /// Units currently held by live/idle `slots` or `cooling` blocks (not yet in `free`).
+    in_use_units: u32,
 }
 
 struct Slot {
@@ -54,7 +56,7 @@ struct Slot {
 }
 
 struct SmallPools<H> {
-    pools: Vec<Pool<H>>,
+    pools: Vec<Option<Pool<H>>>,
     /// Per-size-class (`1..=MAX_UNITS`) reusable blocks `(pool, offset)`.
     free: [Vec<(u32, u32)>; (MAX_UNITS as usize) + 1],
     /// Blocks given back, reusable after `COOL`.
@@ -97,9 +99,44 @@ impl<H: Clone> SmallPools<H> {
     fn drain_cooling(&mut self, now: Instant) {
         while self.cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
             if let Some(((pool, offset, units), _)) = self.cooling.pop_front() {
-                self.free[units as usize].push((pool, offset));
+                if let Some(p) = self.pools.get_mut(pool as usize).and_then(Option::as_mut) {
+                    p.in_use_units -= units;
+                    self.free[units as usize].push((pool, offset));
+                }
             }
         }
+    }
+
+    /// Reclaim completely empty cooled heaps (`in_use_units == 0`), keeping up to `keep_spare`
+    /// empty heaps warm so steady-state streaming does not thrash `CreateHeap`.
+    /// Returns the reclaimed heaps so the caller can drop them outside `SMALL_POOLS.lock()`.
+    fn reclaim_empty_pools(&mut self, keep_spare: usize) -> Vec<H> {
+        let mut empty: Vec<usize> = self
+            .pools
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, p)| p.as_ref().is_some_and(|p| p.in_use_units == 0).then_some(idx))
+            .collect();
+        if empty.len() <= keep_spare {
+            return Vec::new();
+        }
+        let mut reclaimed = Vec::with_capacity(empty.len() - keep_spare);
+        for idx in empty.drain(keep_spare..) {
+            let target = idx as u32;
+            for list in &mut self.free {
+                list.retain(|&(pool, _)| pool != target);
+            }
+            if let Some(pool) = self.pools[idx].take() {
+                reclaimed.push(pool.heap);
+            }
+        }
+        reclaimed
+    }
+
+    fn sweep_and_reclaim(&mut self, now: Instant, keep_spare: usize) -> Vec<H> {
+        self.sweep_idle(now);
+        self.drain_cooling(now);
+        self.reclaim_empty_pools(keep_spare)
     }
 
     /// Try to acquire an existing shared slot for `(va, units)` or allocate a block from existing
@@ -109,21 +146,24 @@ impl<H: Clone> SmallPools<H> {
         if let Some(s) = self.slots.get_mut(&key) {
             s.users += 1;
             s.idle_since = None;
-            return Some((self.pools[s.pool as usize].heap.clone(), s.offset));
+            return Some((self.pools[s.pool as usize].as_ref().expect("live small pool").heap.clone(), s.offset));
         }
         let units = key.1;
         debug_assert!((1..=MAX_UNITS).contains(&units));
         self.drain_cooling(now);
         let (pool, offset) = if let Some(b) = self.free[units as usize].pop() {
+            let p = self.pools[b.0 as usize].as_mut().expect("live small pool for free block");
+            p.in_use_units += units;
             b
-        } else if let Some((idx, p)) = self.pools.iter_mut().enumerate().rev().find(|(_, p)| p.next_unit + units <= POOL_UNITS) {
+        } else if let Some((idx, Some(p))) = self.pools.iter_mut().enumerate().rev().find(|(_, p)| p.as_ref().is_some_and(|p| p.next_unit + units <= POOL_UNITS)) {
             let off = p.next_unit;
             p.next_unit += units;
+            p.in_use_units += units;
             (idx as u32, off)
         } else {
             return None;
         };
-        let heap = self.pools[pool as usize].heap.clone();
+        let heap = self.pools[pool as usize].as_ref().expect("live small pool").heap.clone();
         self.slots.insert(key, Slot { pool, offset, users: 1, idle_since: None });
         self.used_units += units as usize;
         Some((heap, offset))
@@ -137,8 +177,14 @@ impl<H: Clone> SmallPools<H> {
         if let Some(got) = self.try_acquire(key, now) {
             return got;
         }
-        let pool_idx = self.pools.len() as u32;
-        self.pools.push(Pool { heap, next_unit: 0 });
+        let pool_idx = if let Some(idx) = self.pools.iter().position(Option::is_none) {
+            self.pools[idx] = Some(Pool { heap, next_unit: 0, in_use_units: 0 });
+            idx as u32
+        } else {
+            let idx = self.pools.len() as u32;
+            self.pools.push(Some(Pool { heap, next_unit: 0, in_use_units: 0 }));
+            idx
+        };
         if let Some(got) = self.try_acquire(key, now) {
             return got;
         }
@@ -160,7 +206,10 @@ impl<H: Clone> SmallPools<H> {
             if rollback {
                 if let Some(s) = self.slots.remove(&key) {
                     self.used_units -= key.1 as usize;
-                    self.free[key.1 as usize].push((s.pool, s.offset));
+                    if let Some(p) = self.pools.get_mut(s.pool as usize).and_then(Option::as_mut) {
+                        p.in_use_units -= key.1;
+                        self.free[key.1 as usize].push((s.pool, s.offset));
+                    }
                 }
             } else {
                 s.idle_since = Some(now);
@@ -178,7 +227,8 @@ impl<H: Clone> SmallPools<H> {
     }
 
     fn bytes(&self) -> (usize, usize) {
-        (self.used_units * UNIT, self.pools.len() * POOL_UNITS as usize * UNIT)
+        let live_pools = self.pools.iter().filter(|p| p.is_some()).count();
+        (self.used_units * UNIT, live_pools * POOL_UNITS as usize * UNIT)
     }
 
     #[cfg(test)]
@@ -245,12 +295,15 @@ pub(super) unsafe fn place(
     let key = (va, units);
     let now = Instant::now();
 
-    let (heap, offset_units) = {
+    let (got, dropped) = {
         let mut g = SMALL_POOLS.lock().unwrap();
         let pools = g.entry(dev_key).or_insert_with(SmallPools::new);
-        pools.try_acquire(key, now)
-    }
-    .or_else(|| {
+        let got = pools.try_acquire(key, now);
+        let dropped = pools.reclaim_empty_pools(super::vram::keep_spare_pools());
+        (got, dropped)
+    };
+    log_and_drop_reclaimed(dropped);
+    let (heap, offset_units) = got.or_else(|| {
         // Create a new 16 MiB default heap outside `SMALL_POOLS.lock()`.
         let heap_desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_UNITS as u64 * UNIT as u64,
@@ -281,10 +334,16 @@ pub(super) unsafe fn place(
         ppv,
     );
     if hr < 0 || (*ppv).is_null() {
-        let mut g = SMALL_POOLS.lock().unwrap();
-        if let Some(pools) = g.get_mut(&dev_key) {
-            pools.release_key(key, Instant::now(), true);
-        }
+        let dropped = {
+            let mut g = SMALL_POOLS.lock().unwrap();
+            if let Some(pools) = g.get_mut(&dev_key) {
+                pools.release_key(key, Instant::now(), true);
+                pools.reclaim_empty_pools(super::vram::keep_spare_pools())
+            } else {
+                Vec::new()
+            }
+        };
+        log_and_drop_reclaimed(dropped);
         return None;
     }
     let raw = *ppv as usize;
@@ -292,17 +351,47 @@ pub(super) unsafe fn place(
     Some(hr)
 }
 
+fn log_and_drop_reclaimed(dropped: Vec<ID3D12Heap>) {
+    if !dropped.is_empty() {
+        let mb = (dropped.len() * POOL_UNITS as usize * UNIT) >> 20;
+        crate::xlog_info!(
+            "D3D12.X: reclaimed {} empty 16 MiB small texture pool heap(s) ({mb} MiB returned to GPU)",
+            dropped.len(),
+        );
+        drop(dropped);
+    }
+}
+
+/// Sweep expired idle/cooling small-pool blocks for `dev_key` and release any empty heaps
+/// above `XCL_VRAM_KEEP_SPARE_POOLS`, dropping their `ID3D12Heap`s outside `SMALL_POOLS.lock()`.
+pub(super) fn reclaim(dev_key: usize, now: Instant) {
+    let dropped = {
+        let mut g = SMALL_POOLS.lock().unwrap();
+        let Some(pools) = g.get_mut(&dev_key) else { return };
+        pools.sweep_and_reclaim(now, super::vram::keep_spare_pools())
+    };
+    log_and_drop_reclaimed(dropped);
+}
+
 /// Release a small-pool texture on COM release. Returns `true` if `resource` belonged to a small
 /// pool (so `vram::forget` can skip locking `PAGES`).
 pub(super) fn forget(resource: usize) -> bool {
-    let mut g = SMALL_POOLS.lock().unwrap();
-    let now = Instant::now();
-    for pools in g.values_mut() {
-        if pools.forget(resource, now) {
-            return true;
+    let (found, dropped) = {
+        let mut g = SMALL_POOLS.lock().unwrap();
+        let now = Instant::now();
+        let mut found = false;
+        let mut dropped = Vec::new();
+        for pools in g.values_mut() {
+            if pools.forget(resource, now) {
+                dropped = pools.sweep_and_reclaim(now, super::vram::keep_spare_pools());
+                found = true;
+                break;
+            }
         }
-    }
-    false
+        (found, dropped)
+    };
+    log_and_drop_reclaimed(dropped);
+    found
 }
 
 /// `(used_bytes, pool_bytes)` across all devices.
@@ -398,6 +487,52 @@ mod tests {
         assert_eq!(p.bytes().0, used_before_flush + 2 * UNIT);
         p.flush_idle(at(5620));
         assert_eq!(p.bytes().0, used_before_flush, "flush_idle must reclaim unreferenced slots immediately");
+    }
+
+    #[test]
+    fn empty_pools_are_reclaimed_when_keep_spare_is_zero() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p: SmallPools<u32> = SmallPools::new();
+        let mut next_heap = 0u32;
+        let mut alloc = |p: &mut SmallPools<u32>, va: usize, units: u32, res: usize, now: Instant| -> (u32, u32) {
+            let got = p.try_acquire((va, units), now).unwrap_or_else(|| {
+                let id = next_heap;
+                next_heap += 1;
+                p.add_pool_and_acquire(id, (va, units), now)
+            });
+            p.note_resource(res, (va, units));
+            got
+        };
+
+        // Allocate in a single pool and then release it.
+        let (h0, _) = alloc(&mut p, 0x10_0000, 4, 1, at(0));
+        assert_eq!(h0, 0);
+        assert_eq!(p.bytes(), (4 * UNIT, POOL_UNITS as usize * UNIT));
+        assert!(p.forget(1, at(10)));
+
+        // Still idle at +1s: must not reclaim.
+        assert!(p.sweep_and_reclaim(at(1000), 0).is_empty());
+        assert_eq!(p.bytes().1, POOL_UNITS as usize * UNIT);
+
+        // Swept to cooling at +2.1s, but COOL (2s) has not elapsed: must not reclaim yet.
+        assert!(p.sweep_and_reclaim(at(2100), 0).is_empty());
+        assert_eq!(p.bytes().1, POOL_UNITS as usize * UNIT);
+
+        // After IDLE + COOL: with keep_spare=1 the warm spare stays; with keep_spare=0 it drops to 0.
+        assert!(p.sweep_and_reclaim(at(4200), 1).is_empty());
+        assert_eq!(p.bytes(), (0, POOL_UNITS as usize * UNIT));
+
+        let reclaimed = p.sweep_and_reclaim(at(4200), 0);
+        assert_eq!(reclaimed, vec![0]);
+        assert_eq!(p.bytes(), (0, 0), "emptying class with keep_spare=0 must drop retained bytes to 0");
+        assert!(p.free.iter().all(Vec::is_empty), "free lists must not retain stale blocks from reclaimed pool");
+
+        // Subsequent allocation reuses the vacated pool slot cleanly.
+        let (h1, off1) = alloc(&mut p, 0x20_0000, 4, 2, at(4300));
+        assert_eq!((h1, off1), (1, 0));
+        assert_eq!(p.pools.len(), 1, "vacated pool slot should be reused");
+        assert_eq!(p.bytes(), (4 * UNIT, POOL_UNITS as usize * UNIT));
     }
 
     #[test]
